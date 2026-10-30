@@ -104,6 +104,9 @@ sub2api 的映射目标须填写实际模型 ID，例如 `deepseek-v4.1-flash-10
 这份 IDE 日志**不能证明服务端固定限制为 64K，也没有确认它就是参数 400 的根因**；
 同样，DeepSeek 直连 API 的 384K 规格不能证明当前 CodeArts 账号或渠道支持该数值。
 
+2026-10-30 部署复测：用户确认更新代理后，由代理自动收窄到 64K 的请求已正常返回。
+这验证了本次输出预算调整在该部署中有效；尚未测试服务端可接受的精确最大值。
+
 参数 400 的诊断同时记录原始 `model_max_tokens`、`model_output_context_window`、
 实际采用的 `model_output_limit` / `model_output_limit_source` 及 `model_context_window`。
 若仍被拒绝，需结合这些字段继续核对工具定义和消息格式；工具或消息数量本身不足以定因。
