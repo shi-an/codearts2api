@@ -289,8 +289,7 @@ func TestModelsAdvertisesOnlyVerifiedNewCodeArtsModels(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	// 静态兜底只列实测确认可用的模型；未注册的（GLM-5.2-ArkTS-SPARK /
-	// OpenPangu-2.0-Pro/Flash）不得出现，否则等于把 404 写进兜底路径。
+	// 静态兜底不得把展示名作为推理 ID 发布；这些名称须由动态发现映射到真实 ID。
 	for _, bad := range []string{"GLM-5.2-ArkTS-SPARK", "OpenPangu-2.0-Pro", "OpenPangu-2.0-Flash"} {
 		for _, model := range payload.Data {
 			if model.ID == bad {

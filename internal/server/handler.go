@@ -65,12 +65,9 @@ type staticModel struct {
 
 // staticModels 静态兜底表：**只放实测确认可用的模型**。
 //
-// 上游的模型发现（agent-center / builtin）会列出当前账号未注册的模型，静态表
-// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-09-15 真实账号
-// 逐个调用验证（见 docs/reverse-engineering.md §7）：
-//
-//	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B
-//	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
+// 以下清单来自 2026-09-15 的历史验证，不代表当前账号的实时权限。
+// 2026-10-30 发现展示名与推理 ID 不同；历史上使用展示名得到的 not registered
+// 不能作为缺少权限的证据（见 docs/reverse-engineering.md §7）。新增模型依赖动态发现。
 var staticModels = []staticModel{
 	{ID: "GLM-5.2", ContextWindow: 202752},
 	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
@@ -585,8 +582,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 // 3 次，池子超过 3 个账号时可能永远轮不到有能力的那台），又会给健康账号记错误、
 // 累计到阈值就冷却 10 分钟。所以按能力优先挑号。
 func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account {
-	want := strings.ToLower(upstream.CanonicalModel(model))
-	if acct := h.pickByCatalog(tried, want); acct != nil {
+	if acct := h.pickByCatalog(tried, model); acct != nil {
 		return acct
 	}
 	// 目录里没人登记这个模型。两种可能：① 谁都没有；② 目录还没发现
@@ -595,7 +591,7 @@ func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account
 	// （默认 3 次，账号多于 3 个时可能永远轮不到有能力的那台），还会给健康账号
 	// 记错误、到阈值冷却 10 分钟。所以先补齐缺失的目录再挑一次。
 	h.discoverMissingCatalogs(tried)
-	if acct := h.pickByCatalog(tried, want); acct != nil {
+	if acct := h.pickByCatalog(tried, model); acct != nil {
 		return acct
 	}
 	excluded := make(map[string]bool, len(tried))
@@ -611,11 +607,12 @@ func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account
 }
 
 // pickByCatalog 在已发现目录的健康账号里挑第一个能服务该模型的。
-func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.Account {
+func (h *Handler) pickByCatalog(tried map[string]bool, model string) *pool.Account {
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
+		wantLower := strings.ToLower(upstream.CanonicalModelForAccount(acct.UID, model))
 		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, wantLower) {
 			if st, _ := modelAvailability(acct.UID, wantLower); st == availUnusable {
 				continue // 该账号实测调不通这个模型，别选它
@@ -654,7 +651,7 @@ func (h *Handler) accountCanServe(acct *pool.Account, model string) bool {
 	if !known {
 		return true
 	}
-	return catalogHas(models, strings.ToLower(upstream.CanonicalModel(model)))
+	return catalogHas(models, strings.ToLower(upstream.CanonicalModelForAccount(acct.UID, model)))
 }
 
 // catalogHas 按小写 ID 在模型目录里查模型。
@@ -799,10 +796,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var serr error
 		authRetried := false
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
-		channel := upstream.AccountModelChannel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
 		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
-			rc, serr = acct.Client.ChatStreamWithChannel(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, channel)
+			rc, serr = acct.Client.ChatStreamForAccount(r.Context(), acct.UID, chatID, msgs, "", cred, model, chatOpts)
 			if serr == nil {
 				break
 			}

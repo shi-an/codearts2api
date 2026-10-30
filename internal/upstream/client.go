@@ -479,6 +479,13 @@ func (c *Client) ChatStreamWithChannel(ctx context.Context, chatID string, messa
 	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), channel)
 }
 
+// ChatStreamForAccount 使用实际账号的模型 ID 和渠道，不受全局展示别名影响。
+func (c *Client) ChatStreamForAccount(ctx context.Context, accountID, chatID string, messages []ChatMessage, traceID string, cred SignCredential, model string, opts ChatOptions) (io.ReadCloser, error) {
+	body := chatBodyV2(chatID, messages, model, opts)
+	body["model"] = CanonicalModelForAccount(accountID, model)
+	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), AccountModelChannel(accountID, model))
+}
+
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
 func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOptions) map[string]any {
 	body := map[string]any{

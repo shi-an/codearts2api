@@ -39,6 +39,7 @@ func main() {
 	if _, err := c.FetchModels(a); err != nil {
 		fmt.Fprintf(os.Stderr, "model discovery: %v\n", err)
 	}
+	model = upstream.CanonicalModelForAccount(a.UserID, model)
 	channel := upstream.AccountModelChannel(a.UserID, model)
 	chatID := fmt.Sprintf("%032x", time.Now().UnixNano())[:32]
 	fmt.Println("chat_id=", chatID, "user=", a.UserName, "uid=", a.UserID, "msg=", msg, "mode=", mode)
@@ -67,7 +68,7 @@ func main() {
 		}
 		rc, err = c.SendChatV2WithChannel(context.Background(), body, "", cred, cred.SecurityToken, channel)
 	default:
-		rc, err = c.ChatStreamWithChannel(context.Background(), chatID, []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, a.UserName, model, upstream.ChatOptions{}, channel)
+		rc, err = c.ChatStreamForAccount(context.Background(), a.UserID, chatID, []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, model, upstream.ChatOptions{})
 	}
 	if err != nil {
 		panic(err)
