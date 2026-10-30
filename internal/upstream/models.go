@@ -35,6 +35,7 @@ const CatalogTTL = time.Hour
 const (
 	HeaderMaasType = "maas_type"
 	MaasBenefit    = "benefit"
+	MaasEducation  = "education"
 )
 
 // ModelInfo 模型信息（与 workbuddy/trae 一致）。
@@ -43,9 +44,21 @@ type ModelInfo struct {
 	Name          string `json:"name"`
 	ContextWindow int64  `json:"contextWindow,omitempty"`
 	MaxTokens     int64  `json:"maxTokens,omitempty"`
-	// Benefit 限时福利（免费套餐）模型：聊天需带 maas_type: benefit 头。
-	Benefit bool   `json:"benefit,omitempty"`
-	Desc    string `json:"desc,omitempty"`
+	// Benefit 兼容旧版字段；教育渠道也属于客户端的权益模型。
+	Benefit  bool   `json:"benefit,omitempty"`
+	MaasType string `json:"maas_type,omitempty"`
+	Desc     string `json:"desc,omitempty"`
+}
+
+// ModelChannel 返回模型的权益渠道；旧版 Benefit=true 等价于 benefit。
+func ModelChannel(mi ModelInfo) string {
+	if mi.MaasType != "" {
+		return mi.MaasType
+	}
+	if mi.Benefit {
+		return MaasBenefit
+	}
+	return ""
 }
 
 // 冷启动种子：福利套餐轮换后新增的模型在首次发现前也要走福利路由，
@@ -71,9 +84,10 @@ var seedBenefit = func() map[string]bool {
 
 // accountCatalog 一个账号的模型目录快照。
 type accountCatalog struct {
-	infos   []ModelInfo
-	benefit map[string]bool // lower(id) -> true（本轮发现确认的福利）
-	knows   map[string]bool // lower(id) -> true（该账号目录里登记过的全部模型）
+	infos    []ModelInfo
+	channels map[string]string // lower(id) -> maas_type
+	gateways map[string]bool   // 仅记录成功读取的渠道开关；失败不能当作关闭
+	knows    map[string]bool   // lower(id) -> true（该账号目录里登记过的全部模型）
 	// lastBenefit 上一次福利来源成功时的福利条目。福利网关临时故障时用它兜底：
 	// 只在内置来源明确说「它不是福利」时才摘标记，否则保留，避免把
 	// maas_type: benefit 头弄丢（丢了就是 InferHub.002002009.404）。
@@ -108,12 +122,20 @@ func SetAccountModels(accountID string, infos []ModelInfo) {
 // 福利条目，否则非种子的福利模型会瞬间丢掉 maas_type: benefit 标记，直到下一次
 // 刷新成功为止——这期间它们在上游按未注册模型 404。
 func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
+	setAccountChannelModels(accountID, infos, map[string]bool{
+		MaasBenefit: keepBenefit, MaasEducation: keepBenefit,
+	}, nil)
+}
+
+// setAccountChannelModels 按渠道保留临时失败的模型，成功关闭的渠道立即摘除。
+func setAccountChannelModels(accountID string, infos []ModelInfo, keepChannels, gateways map[string]bool) {
 	if accountID == "" {
 		return
 	}
 	ac := &accountCatalog{
 		infos:       append([]ModelInfo(nil), infos...),
-		benefit:     make(map[string]bool),
+		channels:    make(map[string]string),
+		gateways:    make(map[string]bool),
 		knows:       make(map[string]bool),
 		lastBenefit: map[string]ModelInfo{},
 		fetched:     time.Now(),
@@ -124,9 +146,17 @@ func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 		catalog.known = map[string]string{}
 	}
 	if prev := catalog.accounts[accountID]; prev != nil {
-		for k, v := range prev.lastBenefit {
-			ac.lastBenefit[k] = v
+		for channel, enabled := range prev.gateways {
+			ac.gateways[channel] = enabled
 		}
+		for k, v := range prev.lastBenefit {
+			if keepChannels[ModelChannel(v)] {
+				ac.lastBenefit[k] = v
+			}
+		}
+	}
+	for channel, enabled := range gateways {
+		ac.gateways[channel] = enabled
 	}
 	for _, mi := range ac.infos {
 		if mi.ID == "" {
@@ -134,21 +164,24 @@ func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 		}
 		key := strings.ToLower(mi.ID)
 		ac.knows[key] = true
-		if mi.Benefit {
-			ac.benefit[key] = true
+		if channel := ModelChannel(mi); channel != "" {
+			ac.channels[key] = channel
 			ac.lastBenefit[key] = mi
 		}
 		if _, ok := catalog.known[key]; !ok || mi.ID != key {
 			catalog.known[key] = mi.ID
 		}
 	}
-	if keepBenefit {
+	if len(ac.lastBenefit) > 0 {
 		// 本轮内置来源没有提到的福利模型：继续按福利路由（宁可多带，不可漏带）。
 		for key, mi := range ac.lastBenefit {
 			if ac.knows[key] {
+				if ac.channels[key] == "" {
+					delete(ac.lastBenefit, key)
+				}
 				continue // 内置来源明确登记了它 → 已转正，不保留标记
 			}
-			ac.benefit[key] = true
+			ac.channels[key] = ModelChannel(mi)
 			ac.knows[key] = true
 			ac.infos = append(ac.infos, mi)
 			if _, ok := catalog.known[key]; !ok || mi.ID != key {
@@ -194,21 +227,46 @@ func AccountCatalogStale(accountID string) bool {
 //  3. 目录里没有这个模型（尚未发现、福利来源失败或未领取）→ 回退冷启动种子，
 //     少带一次头就是一次 InferHub.002002009.404，宁可多带
 func IsBenefitModel(accountID, model string) bool {
+	return AccountModelChannel(accountID, model) == MaasBenefit
+}
+
+// AccountModelChannel 按账号解析渠道，明确关闭的福利网关覆盖冷启动种子。
+func AccountModelChannel(accountID, model string) string {
 	key := strings.ToLower(strings.TrimSpace(model))
 	if key == "" {
-		return false
+		return ""
 	}
 	catalog.RLock()
 	defer catalog.RUnlock()
 	if ac, ok := catalog.accounts[accountID]; ok {
-		if ac.benefit[key] {
-			return true
+		if channel := ac.channels[key]; channel != "" {
+			return channel
 		}
 		if ac.knows[key] {
-			return false
+			return ""
+		}
+		if enabled, known := ac.gateways[MaasBenefit]; known && !enabled {
+			return ""
 		}
 	}
-	return seedBenefit[key]
+	if seedBenefit[key] {
+		return MaasBenefit
+	}
+	return ""
+}
+
+// AccountModelGatewayDisabled 排除已关闭福利渠道中的历史种子；
+// 同名模型若已由当前目录登记（含普通或教育渠道），仍按当前目录处理。
+func AccountModelGatewayDisabled(accountID, model string) bool {
+	key := strings.ToLower(strings.TrimSpace(model))
+	catalog.RLock()
+	defer catalog.RUnlock()
+	ac := catalog.accounts[accountID]
+	if ac == nil || ac.knows[key] || !seedBenefit[key] {
+		return false
+	}
+	enabled, known := ac.gateways[MaasBenefit]
+	return known && !enabled
 }
 
 // lookupKnownModel 按小写 ID 查精确模型 ID（种子 + 已发现模型）。
@@ -257,12 +315,16 @@ func MergeModels(sets ...[]ModelInfo) []ModelInfo {
 
 // richerModel 合并同一模型的两条记录：福利标记取或（漏标即漏头），其余取更全的一条。
 func richerModel(cur, next ModelInfo) ModelInfo {
-	benefit := cur.Benefit || next.Benefit
+	channel := ModelChannel(cur)
+	if nextChannel := ModelChannel(next); channel == "" || nextChannel == MaasBenefit {
+		channel = nextChannel
+	}
 	keep, drop := cur, next
 	if betterModel(next, cur) {
 		keep, drop = next, cur
 	}
-	keep.Benefit = benefit
+	keep.Benefit = channel != ""
+	keep.MaasType = channel
 	if keep.Name == "" {
 		keep.Name = drop.Name
 	}
@@ -305,26 +367,34 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	} else {
 		sets = append(sets, infos)
 	}
-	builtinOK := false
 	if infos, err := c.fetchBuiltinModels(accountID, cred); err != nil {
 		Log("builtin models: %v", err)
 	} else {
-		builtinOK = true
 		sets = append(sets, infos)
 	}
-	benefitOK := false
-	if infos, err := c.fetchBenefitModels(accountID, cred); err != nil {
-		Log("benefit models: %v", err)
-	} else {
-		benefitOK = true
-		sets = append(sets, infos)
+	keepChannels := map[string]bool{}
+	gateways := map[string]bool{}
+	for _, channel := range []string{MaasBenefit, MaasEducation} {
+		infos, enabled, err := c.fetchChannelModels(accountID, cred, channel)
+		if enabled != nil {
+			gateways[channel] = *enabled
+		}
+		if err != nil {
+			Log("%s models: %v", channel, err)
+			keepChannels[channel] = true
+		} else {
+			sets = append(sets, infos)
+		}
 	}
 	out := MergeModels(sets...)
+	// 即使本次只有关闭开关，也要更新目录，避免过期渠道被旧缓存复活。
+	if len(out) > 0 || len(gateways) > 0 {
+		setAccountChannelModels(accountID, out, keepChannels, gateways)
+		out, _ = AccountModels(accountID)
+	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 福利来源失败但内置来源成功：保留上一轮已确认的福利条目，别把标记弄丢。
-	setAccountModels(accountID, out, builtinOK && !benefitOK)
 	return out, nil
 }
 
@@ -469,19 +539,21 @@ func (c *Client) fetchBuiltinModels(accountID string, cred SignCredential) ([]Mo
 	return infos, nil
 }
 
-// ClaimBenefit 领取限时福利（幂等：已领取返回成功）。官方客户端打开模型菜单即调用。
-//
-// 这是对账号的写操作，默认不随模型发现自动执行（见 Client.SetBenefitAutoClaim）：
-// 需要领取时显式调用（`codearts2api models -claim` 或打开自动领取开关）。
+// ClaimBenefit 显式领取默认福利渠道（幂等）。自动领取仅在渠道开关启用时执行。
 func (c *Client) ClaimBenefit(cred SignCredential) error {
+	return c.claimChannelBenefit(cred, MaasBenefit)
+}
+
+func (c *Client) claimChannelBenefit(cred SignCredential, channel string) error {
 	body, _ := json.Marshal(map[string]any{})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.benefitURL(EpBenefitClaim), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, channelURL(c.benefitURL(EpBenefitClaim), channel), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Agent-Type", "PromptCenter")
 	req.Header.Set("X-Language", "zh-cn")
 	if cred.SecurityToken != "" {
 		req.Header.Set("X-Security-Token", cred.SecurityToken)
@@ -509,20 +581,20 @@ func (c *Client) ClaimBenefit(cred SignCredential) error {
 	return nil
 }
 
-// fetchBenefitModels 拉取限时福利模型（gateway/config），返回结果整体标记 Benefit。
-func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]ModelInfo, error) {
-	key := accountID + "|benefit"
+// fetchGatewayModels 拉取已启用渠道的模型；开关检查由 fetchChannelModels 完成。
+func (c *Client) fetchGatewayModels(accountID string, cred SignCredential, channel string) ([]ModelInfo, error) {
+	key := accountID + "|" + channel
 	if c.srcBlocked(key) {
-		return nil, fmt.Errorf("benefit source backoff")
+		return nil, fmt.Errorf("%s source backoff", channel)
 	}
 	if c.claimAuto.Load() {
-		if err := c.ClaimBenefit(cred); err != nil {
-			Log("benefit claim: %v", err)
+		if err := c.claimChannelBenefit(cred, channel); err != nil {
+			Log("%s claim: %v", channel, err)
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.benefitURL(EpBenefitConfig), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, channelURL(c.benefitURL(EpBenefitConfig), channel), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -548,11 +620,14 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 		Result    struct {
 			BaseURL string `json:"base_url"`
 			Models  []struct {
-				ModelID       string `json:"model_id"`
-				ModelName     string `json:"model_name"`
-				ModelDesc     string `json:"model_desc"`
-				ContextWindow int64  `json:"context_window"`
-				MaxTokens     int64  `json:"max_tokens"`
+				ModelID        string `json:"model_id"`
+				ModelIDCamel   string `json:"modelId"`
+				ModelName      string `json:"model_name"`
+				ModelNameCamel string `json:"modelName"`
+				ModelDesc      string `json:"model_desc"`
+				Description    string `json:"description"`
+				ContextWindow  int64  `json:"context_window"`
+				MaxTokens      int64  `json:"max_tokens"`
 			} `json:"models"`
 		} `json:"result"`
 	}
@@ -564,17 +639,21 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 		c.noteSrcFail(key)
 		return nil, fmt.Errorf("gateway/config error_code=%s", out.ErrorCode)
 	}
+	if out.Result.Models == nil {
+		c.noteSrcFail(key)
+		return nil, fmt.Errorf("gateway/config response missing models array")
+	}
 	c.clearSrcFail(key)
 	infos := make([]ModelInfo, 0, len(out.Result.Models))
 	for _, m := range out.Result.Models {
-		id := firstNonEmpty(m.ModelID, m.ModelName)
+		id := firstNonEmpty(m.ModelID, m.ModelIDCamel, m.ModelName, m.ModelNameCamel)
 		if id == "" {
 			continue
 		}
 		infos = append(infos, ModelInfo{
 			ID: id, Name: id,
-			ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Desc: m.ModelDesc,
-			Benefit: true,
+			ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Desc: firstNonEmpty(m.ModelDesc, m.Description),
+			Benefit: true, MaasType: channel,
 		})
 	}
 	return infos, nil

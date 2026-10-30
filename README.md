@@ -62,32 +62,36 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 指定函数不存在或重复定义时返回 400。上游 `InferHub.001001005` 参数错误也返回 400，
 不轮换、不冷却账号；若流式响应已开始，则用 SSE 错误事件结束，同样不处罚账号。
 
-### 模型列表与限时福利
+### 模型列表与客户端权益渠道
 
 `/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`Qwen3-VL-235B`），
-同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。限时福利
-（免费套餐）模型额外带 `benefit: true` 标记，聊天时服务端会自动追加上游要求的
-`maas_type: benefit` 请求头（按发起请求的账号判定，多账号套餐不同也不会串——
+同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。福利和教育
+渠道模型额外带 `benefit: true` 及 `maas_type: benefit / education` 标记，聊天时服务端
+会按渠道追加上游要求的 `maas_type` 请求头并签名（按发起请求的账号判定——
 列表是各账号可用模型的并集，实际路由会优先挑目录里真有这个模型的账号）。
 
 福利模型列表随免费套餐轮换，用下面这条命令核对当前账号实际可用的模型：
 
 ```bash
-go run ./cmd/models                 # 账号可用模型（内置 + 福利）
+go run ./cmd/models                 # 账号模型（内置 + 已启用的福利/教育渠道）
 go run ./cmd/models -json           # 机器可读
-go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，属写操作）
+go run ./cmd/models -claim          # 仅对已启用渠道领取后查询（幂等，属写操作）
+go run ./cmd/models -claim=false    # 不自动领取，仍查询已启用渠道
 ```
 
-限时福利模型**必须先领取才能调用**：未领取时上游一律返回
-`InferHub.4004.200 benefit not found`（实测）。领取是幂等操作，官方客户端打开模型
-菜单时也会调用，因此服务默认会领取（`benefit_auto_claim: true`）。不想让服务写账号
-可显式关闭：
+对齐 CodeArts 桌面客户端 0.2.6：先查询 `/v1/benefit-gateway-config` 与
+`/v1/education-gateway-config`，只有 `enabled=true` 才查询相应模型并自动领取。
+**关闭渠道不会调用旧领取接口，也不会从静态种子补回过期福利模型**；这不代表普通
+内置模型停用。开关或模型接口临时失败时保留上次已确认的渠道模型；业务错误不会被当作关闭。
+
+尚未领取或已经过期的权益可能返回 `InferHub.4004.200 benefit not found`。服务默认
+自动领取已启用渠道（`benefit_auto_claim: true`）；不想让服务写账号可显式关闭：
 
 ```jsonc
 "benefit_auto_claim": false   // 或 CA2A_BENEFIT_AUTO_CLAIM=0
 ```
 
-关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
+关闭自动领取不影响已领取的有效权益。模型是否能调用仍取决于当前账号权限、额度及探测结果。
 
 ### 模型可用性探测
 

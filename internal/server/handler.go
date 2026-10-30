@@ -418,9 +418,7 @@ func (h *Handler) modelList() []map[string]any {
 				kept = append(kept, e)
 			}
 		}
-		if len(kept) > 0 {
-			entries = kept
-		}
+		entries = kept
 	}
 	// 刚发现到的模型还没有可用性结论：后台补一轮探测，供后续请求过滤。
 	// （首次请求返回的是「发现结果」，之后才收敛到「真实可用」。）
@@ -457,6 +455,10 @@ func (h *Handler) modelKnownUnusable(model string) bool {
 		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
+		if upstream.AccountModelGatewayDisabled(acct.UID, model) {
+			anyKnown = true
+			continue
+		}
 		st, _ := modelAvailability(acct.UID, model)
 		if st == availUnknown {
 			return false // 还没结论，别急着下架
@@ -477,7 +479,7 @@ func (h *Handler) modelKnownUnusable(model string) bool {
 func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(infos)+len(staticModels))
 	seen := map[string]bool{}
-	add := func(id string, ctx, maxOut int64, benefit bool) {
+	add := func(id string, ctx, maxOut int64, channel string) {
 		if id == "" || seen[id] {
 			return
 		}
@@ -495,23 +497,28 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 		if maxOut > 0 {
 			entry["max_output_tokens"] = maxOut
 		}
-		if benefit {
+		if channel != "" {
 			entry["benefit"] = true
+			entry["maas_type"] = channel
 		}
 		out = append(out, entry)
 	}
 	// addAlias 精确 ID + 就近补一条小写别名（已是小写则跳过）。
-	addAlias := func(id string, ctx, maxOut int64, benefit bool) {
-		add(id, ctx, maxOut, benefit)
+	addAlias := func(id string, ctx, maxOut int64, channel string) {
+		add(id, ctx, maxOut, channel)
 		if lower := strings.ToLower(id); lower != id {
-			add(lower, ctx, maxOut, benefit)
+			add(lower, ctx, maxOut, channel)
 		}
 	}
 	for _, mi := range infos {
-		addAlias(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
+		addAlias(mi.ID, mi.ContextWindow, mi.MaxTokens, upstream.ModelChannel(mi))
 	}
 	for _, sm := range staticModels {
-		addAlias(sm.ID, sm.ContextWindow, 0, sm.Benefit)
+		channel := ""
+		if sm.Benefit {
+			channel = upstream.MaasBenefit
+		}
+		addAlias(sm.ID, sm.ContextWindow, 0, channel)
 	}
 	return out
 }
@@ -591,7 +598,16 @@ func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account
 	if acct := h.pickByCatalog(tried, want); acct != nil {
 		return acct
 	}
-	return h.cfg.Pool.PickExcluding(tried)
+	excluded := make(map[string]bool, len(tried))
+	for name, skip := range tried {
+		excluded[name] = skip
+	}
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct != nil && upstream.AccountModelGatewayDisabled(acct.UID, model) {
+			excluded[acct.Name] = true
+		}
+	}
+	return h.cfg.Pool.PickExcluding(excluded)
 }
 
 // pickByCatalog 在已发现目录的健康账号里挑第一个能服务该模型的。
@@ -783,10 +799,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var serr error
 		authRetried := false
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
-		benefit := upstream.IsBenefitModel(acct.UID, model)
+		channel := upstream.AccountModelChannel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
 		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
-			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
+			rc, serr = acct.Client.ChatStreamWithChannel(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, channel)
 			if serr == nil {
 				break
 			}

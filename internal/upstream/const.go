@@ -34,6 +34,9 @@ const (
 	BenefitHost     = "https://opengw.developer.huaweicloud.com"
 	EpBenefitConfig = "/api/v1/gateway/config"
 	EpBenefitClaim  = "/api/v1/benefit/claim"
+	// 策略中心渠道开关（官方桌面客户端 BenefitService）。
+	EpBenefitGateway   = "/v1/benefit-gateway-config"
+	EpEducationGateway = "/v1/education-gateway-config"
 
 	// 登录/令牌
 	EpLoginTicket    = "/v1/login/ticket"

@@ -204,6 +204,10 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 				t.Errorf("builtin 接口需带 Agent-Type: PromptCenter，got=%q", r.Header.Get("Agent-Type"))
 			}
 			_, _ = io.WriteString(w, `{"builtinModels":[{"model_id":"OpenPangu-2.0-Pro","context_window":524288}]}`)
+		case EpBenefitGateway:
+			_, _ = io.WriteString(w, `{"enabled":true}`)
+		case EpEducationGateway:
+			_, _ = io.WriteString(w, `{"enabled":false}`)
 		case "/api/v1/gateway/config":
 			_, _ = io.WriteString(w, `{"error_code":"0000","result":{"base_url":"https://example.invalid","models":[`+
 				`{"model_id":"glm-5.3-flash","context_window":1048576,"max_tokens":65536}]}}`)

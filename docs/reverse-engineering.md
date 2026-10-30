@@ -181,6 +181,29 @@ Body：
   明确登记了该模型（视为转正）才摘掉标记。
 - 冷启动种子（`seedBenefitModels`）：首次发现前也要带福利头，少带一次就是一次 404。
 
+### 2026-10-30：对照桌面客户端 0.2.6
+
+本次依据已安装官方客户端 `resources/app.asar` 中的 `out/main/index.js`
+（`ModelService` / `BenefitService`）与 renderer 的 `channelOf`、
+`AgentKernelAdapter` 核实。上述 2026-09 的套餐和实测结果是历史记录，不能据此承诺当前账号仍有相同权益。
+
+- **先检查开关**：策略中心 `/v1/benefit-gateway-config`、
+  `/v1/education-gateway-config` 均须签名并带 `Agent-Type: PromptCenter`。
+  支持顶层 `enabled` 或 `result.enabled`；只有明确启用的渠道才进入领取与模型发现。
+- **按渠道查询**：默认福利继续使用不带 channel 的 `/api/v1/gateway/config`；
+  教育使用 `?channel=education`。领取教育权益时也传该参数，领取请求需签名
+  `Agent-Type: PromptCenter`；模型发现请求沿用客户端的无 Agent-Type 形式。
+- **渠道元数据**：发现结果保留 `maas_type=benefit/education`；聊天仍使用
+  客户端 `/api/v2/chat/completions`，按当前账号目录在签名前加入渠道头，普通模型不带。
+  `/v1/models` 及 `cmd/models -json` 返回渠道字段；同 ID 同时存在两个权益渠道时，
+  本服务沿用福利优先的兼容策略，实际请求仍按所选账号自己的目录路由。
+- **关闭与故障分开处理**：明确关闭时丢弃该渠道历史条目，并禁止静态福利种子补位；
+  超时、HTTP/业务错误、无效响应或退避属于未知状态，跳过本次领取/发现并保留已确认条目。
+  单个渠道失败不影响其他来源成功返回的模型；返回给调用方的列表与保存的目录一致。
+- **移除结果不再复活**：成功发现时替换旧渠道记忆；后续临时失败不能重新带回已经删除的模型。
+- **验证范围**：回归测试覆盖开关、渠道参数、请求头签名、账号隔离和部分发现失败。
+  本次未用真实账号验证新模型权限，启用渠道或模型发现成功都不等于推理可用。
+
 ## 8. 脱敏
 
 本仓库不包含任何真实 token。`auths/`、`data/`、`config.json`、`.env` 均 gitignore。

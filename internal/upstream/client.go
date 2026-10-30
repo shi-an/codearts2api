@@ -113,10 +113,8 @@ type Client struct {
 	// chatURL chat-completions 完整地址覆盖（测试注入用，留空走 snapBase）。
 	chatURL string
 
-	// claimAuto 模型发现时是否自动领取限时福利。
-	// 默认开启：不领取时福利模型一律返回 InferHub.4004.200 benefit not found
-	// （实测 2026-09-15），服务商把「领取」做成幂等操作，官方客户端打开模型
-	// 菜单也会调用；关闭后福利模型列表仍在，但调用必然失败。
+	// claimAuto 已启用渠道发现模型时是否自动领取权益，默认开启。
+	// 渠道关闭或开关查询失败时不执行领取；已领取的权益不因关闭自动领取而失效。
 	claimAuto atomic.Bool
 
 	// 分来源失败退避：同一账号的 builtin/福利接口打不通时短期内不再重试，
@@ -168,7 +166,7 @@ func (c *Client) chatEndpoint() string {
 	return c.snapURL(EpChatV2)
 }
 
-// SetBenefitAutoClaim 设置模型发现时是否自动领取限时福利（默认 false）。
+// SetBenefitAutoClaim 设置已启用渠道发现模型时是否自动领取权益（默认 true）。
 // 关闭时 /v1/models 只读不写，需要领取请显式调用 ClaimBenefit（cmd/models -claim）。
 func (c *Client) SetBenefitAutoClaim(v bool) { c.claimAuto.Store(v) }
 
@@ -468,8 +466,17 @@ func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatM
 
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
 func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
+	channel := ""
+	if benefit {
+		channel = MaasBenefit
+	}
+	return c.ChatStreamWithChannel(ctx, chatID, messages, traceID, cred, userName, model, opts, channel)
+}
+
+// ChatStreamWithChannel 发送按账号目录解析渠道的聊天请求（普通/benefit/education）。
+func (c *Client) ChatStreamWithChannel(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, channel string) (io.ReadCloser, error) {
 	body := chatBodyV2(chatID, messages, model, opts)
-	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), benefit)
+	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), channel)
 }
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
@@ -543,14 +550,26 @@ func sessionIDFor(chatID string) string {
 // benefit=true 时追加 maas_type: benefit（限时福利模型路由），该头在签名前设置，
 // 计入 SignedHeaders。
 func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken string, benefit bool) (io.ReadCloser, error) {
-	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", benefit)
+	channel := ""
+	if benefit {
+		channel = MaasBenefit
+	}
+	return c.SendChatV2WithChannel(ctx, body, traceID, cred, userToken, channel)
+}
+
+// SendChatV2WithChannel 与官方客户端一样在签名前写入所选渠道头。
+func (c *Client) SendChatV2WithChannel(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, channel string) (io.ReadCloser, error) {
+	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", channel)
 }
 
 // sendChatV2 发送聊天请求并返回 SSE 流。
 //
 // chatID/sessionID 作为请求亲和与 prompt cache 标识（不代替 messages 里的语义历史）。
-// benefit 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
-func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+// channel 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
+func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID, channel string) (io.ReadCloser, error) {
+	if channel != "" && channel != MaasBenefit && channel != MaasEducation {
+		return nil, fmt.Errorf("unsupported model channel %q", channel)
+	}
 	raw, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
 	if err != nil {
@@ -559,8 +578,8 @@ func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID st
 	for k, v := range ChatHeadersV2(userToken, traceID, "zh-cn") {
 		httpReq.Header.Set(k, v)
 	}
-	if benefit {
-		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
+	if channel != "" {
+		httpReq.Header.Set(HeaderMaasType, channel)
 	}
 	signRequest(httpReq, raw, cred)
 	if chatID != "" {

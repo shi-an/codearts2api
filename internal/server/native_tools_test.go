@@ -221,6 +221,52 @@ func TestChatCompletionsSignsBenefitHeaderForGLM53Flash(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsSignsEducationChannel(t *testing.T) {
+	headersSeen := make(chan http.Header, 1)
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headersSeen <- r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"education-ok\"}}]}\n\n")
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstreamServer.Close()
+	a := auth.New("education-chat-account", "tester", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream.SetAccountModels(a.UserID, []upstream.ModelInfo{{ID: "Education-Chat-Model", Benefit: true, MaasType: upstream.MaasEducation}})
+	p.Accounts()[0].Client = upstream.NewWithChatEndpoint(5*time.Second, upstreamServer.URL)
+	h := NewHandler(Config{Pool: p, MaxRotate: 1})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"education-chat-model","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "education-ok") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	headers := <-headersSeen
+	if headers.Get("maas_type") != "education" || !strings.Contains(headers.Get("Authorization"), "maas_type") {
+		t.Fatalf("education route/signature missing: channel=%s", headers.Get("maas_type"))
+	}
+}
+
+func TestModelEntriesIncludeEducationChannel(t *testing.T) {
+	entries := modelEntries([]upstream.ModelInfo{{ID: "Education-Entry-Model", Benefit: true, MaasType: upstream.MaasEducation}})
+	found := 0
+	for _, entry := range entries {
+		if strings.EqualFold(entry["id"].(string), "education-entry-model") {
+			found++
+			if entry["maas_type"] != upstream.MaasEducation || entry["benefit"] != true {
+				t.Fatalf("channel metadata lost: %+v", entry)
+			}
+		}
+	}
+	if found != 2 {
+		t.Fatalf("expected exact model ID and lowercase alias, found=%d", found)
+	}
+}
+
 func TestModelsAdvertisesOnlyVerifiedNewCodeArtsModels(t *testing.T) {
 	p, err := pool.New(nil, pool.Config{}, "")
 	if err != nil {

@@ -188,8 +188,8 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 		"stream":   true,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	}
-	rc, err := acct.Client.SendChatV2(ctx, body, "", cred, cred.SecurityToken,
-		upstream.IsBenefitModel(acct.UID, model))
+	rc, err := acct.Client.SendChatV2WithChannel(ctx, body, "", cred, cred.SecurityToken,
+		upstream.AccountModelChannel(acct.UID, model))
 	if err != nil {
 		// 并发上限是暂时的，不代表模型不可用。
 		if strings.Contains(err.Error(), "TM.00001041") {
