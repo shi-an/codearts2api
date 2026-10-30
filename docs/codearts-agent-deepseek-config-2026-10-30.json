@@ -1,0 +1,94 @@
+{
+  "observed_date": "2026-10-30",
+  "timezone": "Asia/Shanghai",
+  "client": "CodeArts Agent IDE",
+  "client_version": "26.10.100",
+  "source": "Read-only projection of official IDE model catalog cache after startup; whitelisted model metadata only.",
+  "scope": "Single local IDE catalog. Does not establish a backend hard maximum or another account/channel budget.",
+  "models": [
+    {
+      "model_id": "deepseek-v4.1-flash-1017",
+      "model_alias": "deepseek-v4.1-flash-1017",
+      "model_type": "admin",
+      "max_tokens": 65536,
+      "output_context_window": 0,
+      "context_window": 1048576,
+      "input_context_window": 0,
+      "input_length": 1044480,
+      "thinking_type": null,
+      "maas_type": null,
+      "parameter_maas_type": null,
+      "is_free_benefit": null,
+      "truncate_length": 1044480,
+      "enable_queue": true,
+      "working_queue_length": 500,
+      "waiting_queue_length": 5000,
+      "working_queue_timeout_s": 600,
+      "temperature": 0.5,
+      "top_p": 0,
+      "top_k": 0,
+      "presence_penalty": 0,
+      "frequency_penalty": 0,
+      "supports_images": false,
+      "supports_computer_use": false,
+      "is_tool_call_priority": true,
+      "channel_source": "codearts",
+      "provider": "internal",
+      "supported_clients": [
+        "all"
+      ],
+      "default_thinking_strength": null,
+      "supported_thinking_strengths": []
+    },
+    {
+      "model_id": "deepseek-v4.1-flash",
+      "model_alias": "deepseek-v4.1-flash",
+      "model_type": "admin",
+      "max_tokens": 65536,
+      "output_context_window": 0,
+      "context_window": 1048576,
+      "input_context_window": 0,
+      "input_length": 1044480,
+      "thinking_type": null,
+      "maas_type": null,
+      "parameter_maas_type": null,
+      "is_free_benefit": null,
+      "truncate_length": 1044480,
+      "enable_queue": true,
+      "working_queue_length": 500,
+      "waiting_queue_length": 5000,
+      "working_queue_timeout_s": 600,
+      "temperature": 0.5,
+      "top_p": 0,
+      "top_k": 0,
+      "presence_penalty": 0,
+      "frequency_penalty": 0,
+      "supports_images": false,
+      "supports_computer_use": false,
+      "is_tool_call_priority": true,
+      "channel_source": "codearts",
+      "provider": "internal",
+      "supported_clients": [
+        "all"
+      ],
+      "default_thinking_strength": null,
+      "supported_thinking_strengths": []
+    }
+  ],
+  "selection": {
+    "model_id": "deepseek-v4.1-flash",
+    "maas_type": null
+  },
+  "gateway_observation": {
+    "observed_at": "2026-10-30 16:12:37 +08:00",
+    "benefit": {
+      "http_status": 200,
+      "enabled": false
+    },
+    "education": {
+      "http_status": 200,
+      "enabled": false,
+      "is_student_certified": false
+    }
+  }
+}

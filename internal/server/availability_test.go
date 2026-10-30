@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func TestUpstreamUnavailableReason(t *testing.T) {
 		msg  string
 		want string
 	}{
-		{`codearts error code=InferHub.002002009.404 msg=The model is not registered, please request other model`, "注册"},
+		{`codearts error code=InferHub.002002009.404 msg=The model is not registered, please request other model`, "模型 ID"},
 		{`codearts error code=InferHub.4004.200 msg=benefit not found`, "福利"},
 		{`codearts error code=TM.00001041 msg=并发会话数已达上限`, ""},
 		{`dial tcp: i/o timeout`, ""},
@@ -27,8 +28,11 @@ func TestUpstreamUnavailableReason(t *testing.T) {
 		if c.want == "" && got != "" {
 			t.Errorf("%q 不应判为模型不可用，got=%q", c.msg, got)
 		}
-		if c.want != "" && got == "" {
-			t.Errorf("%q 应判为模型不可用", c.msg)
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("%q 应包含 %q，got=%q", c.msg, c.want, got)
+		}
+		if text := upstreamUnavailableReasonText(c.msg); text != got {
+			t.Errorf("SSE 错误解释不一致：%q vs %q", text, got)
 		}
 	}
 }
@@ -130,11 +134,11 @@ func TestProbeGapExists(t *testing.T) {
 // 排队重试不能无限等：默认值应远小于原来的 180×10s=30min。
 func TestQueueRetryDefaultBounded(t *testing.T) {
 	h := NewHandler(Config{})
-	total := time.Duration(h.cfg.QueueMaxAttempts) * h.cfg.QueueRetryDelay
-	if total > 10*time.Minute {
+	total := time.Duration(h.cfg.QueueMaxAttempts-1) * h.cfg.QueueRetryDelay
+	if total > 30*time.Second {
 		t.Fatalf("排队重试上限 %s 过长，交互式请求会像挂死", total)
 	}
-	if total < time.Minute {
+	if total < 10*time.Second {
 		t.Fatalf("排队重试上限 %s 过短，瞬时的上游排队会直接失败", total)
 	}
 }

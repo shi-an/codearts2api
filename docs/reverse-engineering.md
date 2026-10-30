@@ -160,26 +160,163 @@ Body：
 - **发现结果优先于冷启动种子**：目录里标了福利 → 带 `maas_type`；目录里有但没标
   （说明它以内置/agent-center 身份注册）→ 不带，福利模型转正后能自动摘掉该头；
   目录里查不到（未发现、福利来源失败或未领取）→ 回退种子带头，避免未注册模型 404。
-- **按账号能力路由**（`internal/server/handler.go` `pickAccount`）：`/v1/models`
-  展示的是各账号目录的并集，聊天会优先挑目录里真有该模型的账号，没有才退回普通轮转。
-  否则混合池里没有该模型的账号会先吃一次 400，白耗一次 `MaxRotate`（只有 3 次，
-  账号多于 3 个时可能永远轮不到有能力的那台），还会给健康账号记错误、到阈值冷却 10 分钟；
-  会话黏性锁定的账号若不能服务当前模型，同样换号而不是硬发。
+- **账号目录与请求映射**：`/v1/models` 展示各账号目录的并集，不代表每个账号都拥有
+  列出的全部模型。聊天发送的精确 ID 与渠道必须由实际使用的账号解析；
+  可用性结论同样按账号保存，模型级错误不应触发账号故障冷却。
 - **`maas_type` 由服务端注入并计入签名**：`SendChatV2` 在 `signRequest` 之前设置该头，
   SignedHeaders 覆盖它（与官方客户端行为一致）。
 - **领取默认开启**：实测未领取时福利模型一律返回 `InferHub.4004.200 benefit not found`，
   领取后同一模型立即可用（`glm-5.3-flash`/`deepseek-v4-flash-0731`/`deepseek-v4-pro-0813`
   均验证通过）。领取是幂等操作，官方客户端打开模型菜单即调用，因此默认执行；
   可用 `benefit_auto_claim=false` 关掉。
-- **发现结果 ≠ 真实可用**：agent-center 与 `/v1/model/builtin` 会列出当前账号未注册的
-  模型（实测 `GLM-5.2-ArkTS-SPARK`、`OpenPangu-2.0-Pro`、`OpenPangu-2.0-Flash` 全部
-  返回 `InferHub.002002009.404`），福利模型未领取时返回 `4004.200`。因此需要一次真实
-  可用性探测，不能只按发现结果列模型。
-- **福利来源失败时保留上一轮福利条目**：三路发现里福利网关可能临时不可用，此时若整体
-  替换目录，非种子的福利模型会丢掉 `maas_type: benefit`，上游按未注册模型 404。因此
-  `setAccountModels(keepBenefit=true)` 会保留上一轮成功发现的福利条目，只有内置来源
-  明确登记了该模型（视为转正）才摘掉标记。
+- **发现结果不保证推理可用**：权限、额度、权益有效期及请求映射都会影响结果。
+  早期用 `GLM-5.2-ArkTS-SPARK`、`OpenPangu-2.0-Pro/Flash` 展示名调用得到的
+  `InferHub.002002009.404`，不能作为账号缺少模型权限的证据：26.10.100 客户端中，
+  它们对应不同的推理 ID（见下表）。福利未领取仍可能返回 `4004.200`。
+  探测必须使用正确的推理 ID 与渠道；未探测的模型也会保留在列表中。
+- **权益来源失败时保留上一轮条目**：临时失败时按 ID + 渠道保留上一次确认的记录；
+  普通目录也出现相同 ID 时，默认选择普通记录，权益记录仍独立保存。成功发现会替换
+  相应渠道的旧记录，明确关闭会移除该渠道记忆。
 - 冷启动种子（`seedBenefitModels`）：首次发现前也要带福利头，少带一次就是一次 404。
+
+### 2026-10-30：对照桌面客户端 0.2.6
+
+本次依据已安装官方客户端 `resources/app.asar` 中的 `out/main/index.js`
+（`ModelService` / `BenefitService`）与 renderer 的 `channelOf`、
+`AgentKernelAdapter` 核实。上述 2026-09 的套餐和实测结果是历史记录，不能据此承诺当前账号仍有相同权益。
+
+- **先检查开关**：策略中心 `/v1/benefit-gateway-config`、
+  `/v1/education-gateway-config` 均须签名并带 `Agent-Type: PromptCenter`。
+  支持顶层 `enabled` 或 `result.enabled`；只有明确启用的渠道才进入领取与模型发现。
+- **按渠道查询**：默认福利继续使用不带 channel 的 `/api/v1/gateway/config`；
+  教育使用 `?channel=education`。领取教育权益时也传该参数，领取请求需签名
+  `Agent-Type: PromptCenter`；模型发现请求沿用客户端的无 Agent-Type 形式。
+- **渠道元数据**：发现结果保留 `maas_type=benefit/education`；聊天仍使用
+  客户端 `/api/v2/chat/completions`，按当前账号目录在签名前加入渠道头，普通模型不带。
+  `cmd/models -json` 保留同 ID 的各渠道记录，参数仅在 ID 与渠道都相同时合并。
+  只提供 ID 时普通记录优先；没有普通记录时沿用 benefit、education 的兼容顺序。
+  `/v1/models` 展示默认记录，聊天、预算与探测使用同一默认渠道。
+- **关闭与故障分开处理**：明确关闭时丢弃该渠道历史条目，并禁止静态福利种子补位；
+  超时、HTTP/业务错误、无效响应或退避属于未知状态，跳过本次领取/发现并保留已确认条目。
+  单个渠道失败不影响其他来源成功返回的模型；返回给调用方的列表与保存的目录一致。
+- **移除结果不再复活**：成功发现时替换旧渠道记忆；后续临时失败不能重新带回已经删除的模型。
+- **验证范围**：回归测试覆盖开关、渠道参数、请求头签名、账号隔离和部分发现失败。
+  本次未用真实账号验证新模型权限，启用渠道或模型发现成功都不等于推理可用。
+
+### 2026-10-30：对照 CodeArts Agent 26.10.100 的模型 ID
+
+依据当前安装的官方客户端 `resources/app/extensions/vscode-codebot/out/extension.js`
+及其模型目录日志，确认客户端优先使用 `model_parameters.model_id`，其次使用
+`model_alias`；`model_name` 用于显示。模型元数据如下：
+
+| 展示名 | 推理 ID |
+| --- | --- |
+| `GLM-5.2` | `GLM-5.2` |
+| `GLM-5.3` | `glm-5.3` |
+| `GLM-5.2-ArkTS-SPARK` | `glm-5.2-sft-harmony` |
+| `OpenPangu-2.0-Pro` | `openpangu-2.0-pro` |
+| `OpenPangu-2.0-Flash` | `openpangu-2.0-flash` |
+
+- agent-center 的解析顺序改为推理参数 ID、别名、顶层 ID、展示名；内置与权益来源
+  同样分开保存 ID 与展示名。合并参数时保留优先来源的 ID，不再偏好大写。
+- 发现结果覆盖冷启动种子的大小写，展示名作为兼容别名；同一账号已有真实 ID 时，
+  其他模型的同名展示别名不能覆盖它。聊天、探测和命令行工具均按本次账号解析。
+- 推理仍使用客户端的 `POST /api/v2/chat/completions`，普通模型不因 ID 错误而额外
+  添加福利头。`not registered` 的日志说明改为核对模型 ID 或路由，不再要求用户注册。
+- 回归测试复现了 `glm-5.3` 被转换成 `GLM-5.3` 的错误，并验证发现、完整聊天请求、
+  探测、渠道签名、跨账号大小写隔离和别名共用可用性缓存。
+  本次使用本地模拟服务验证修复，未使用真实账号进行云端推理。
+
+### 2026-10-30：CodeArts Agent 26.10.100 的 DeepSeek 输出预算
+
+从客户端日志的 `AgentCore model-config update` 完整 JSON 按模型键提取，两个条目分别为：
+
+| 推理 ID | `limit.context` | `limit.input` | `limit.output` |
+| --- | --- | --- | --- |
+| `deepseek-v4.1-flash` | 1048576 | 1044480 | 65536 |
+| `deepseek-v4.1-flash-1017` | 1048576 | 1044480 | 65536 |
+
+扩展的 `updateModels` 将当前目录的 `model_parameters.max_tokens` 直接写入
+`limit.output`，`context_window` 写入 `limit.context`。这里是该客户端当时收到的配置，
+不代表模型厂商直连 API 的输出规格，也不保证所有账号、渠道或后续版本一致。
+原始 `models info` 日志可能被截断，不能跨模型搜索后把相邻 GLM 的字段误当 DeepSeek 参数。
+
+65536 是本地 IDE 当时使用的预算，尚未通过真实推理确认服务端拒绝阈值；这份日志也未能
+确认用户 Linux 部署账号的实际配置，不能据此把所有参数 400 归因于超过 64K。
+
+服务按当前账号所选渠道的目录预算调整请求；跳过 `/v1/models` 的带预算请求会补查目录，受请求取消和
+10 秒总超时约束。取消或总超时不写入半份目录；已有参数仍可用于预算检查，未知上限保持
+原请求。回归用本地模拟服务覆盖 214057 预算、86 工具和 155 消息的参数调整、账号轮转、
+并发发现与失败退避；未使用真实账号确认该调整是否消除所有云端 400。
+
+### 2026-10-30：桌面端输出字段与同名渠道记录
+
+继续核对官方 CodeArts 0.2.6 的 `out/main/index.js` 与
+`out/renderer/assets/index-MEKoVEbG.js`，发现两处需要兼容的差异：
+
+| 入口 | 已核实的请求协议 | 输出预算读取方式 |
+| --- | --- | --- |
+| CodeArts Agent IDE 26.10.100 | `/api/v2/chat/completions` | `model_parameters.max_tokens` → `limit.output` |
+| CodeArts 桌面端 0.2.6 | `/api/v2/chat/completions` | `output_context_window` 优先，回退到 `max_tokens` |
+| CodeArts 网页端（先前抓取） | `/chat/.../cloudagent/sessions/.../messages` | 尚未核实，不能由客户端目录推断 |
+
+- 桌面端 `flattenBuiltinModels` 的 context 顺序为 `context_window`、
+  `input_context_window`；output 顺序为 `output_context_window`、`max_tokens`。
+  代理在 agent-center、内置和权益来源中保留两个输出字段，正数预算采用相同优先级。
+  未使用客户端本地默认常量推测未知账号的预算。
+- 桌面端把普通和权益模型数组拼接，`findModel(modelId, maasType)` 可按二者共同选择。
+  IDE 的 `isCurrentModelBenefitType` 在普通目录匹配同名 ID 时返回 false。
+  旧代理按 ID 合并并对权益标记取或，会拼出普通参数加权益路由的记录，现改为
+  按 ID + 渠道合并。默认普通优先，只有权益记录时沿用 benefit、education 顺序；
+  该顺序是兼容接口的默认选择，不能据此推断哪个渠道额度更大或排队更短。
+- 内置目录自带的 `is_free_benefit` / `maas_type` 也参与渠道解析，不能仅凭数据来源
+  把条目标成普通模型。渠道缓存独立保留；关闭或成功返回空目录后不会被后续失败复活。
+- 输出预算、`/v1/models` 与探测使用默认记录；可用性缓存按账号 + ID + 渠道隔离，
+  渠道变化后不沿用另一渠道的不可用结论。相同 ID 的多条记录只触发一次默认渠道探测。
+- 400 诊断保留 `model_max_tokens`、`model_output_context_window`，并增加
+  `model_output_limit` / `model_output_limit_source`；收窄日志也记录渠道和来源字段。
+
+本地模拟回归覆盖四路解析、同渠道字段补齐、字段优先级、跨渠道隔离、部分失败与关闭、
+高于 64K 的预算透传、实际请求渠道签名和诊断脱敏。393216 等测试数值为合成样本，
+当时尚未拿到 DeepSeek 的完整原始字段；后续实际缓存核对见下节。代理侧未直接进行真实云端推理。
+
+随后用户部署复测确认：更新代理后，自动收窄到 64K 的请求已正常返回；成功路径使用了
+代理的预算调整。该反馈验证了修正的实际效果，但尚无新的实时目录或完整请求日志，
+也未测试大于 64K 时的精确接受阈值，不能据此认定所有账号或渠道都固定限制为 64K。
+
+### 2026-10-30：完整原始目录缓存核对
+
+官方 IDE 启动刷新后，运行时配置仍为 1M 上下文、65536 输出预算。由于 `models info`
+日志在约 5KB 处截断，继续以 SQLite 只读查询精确的扩展模型缓存键
+`huaweicloud.codearts-snap` → `hc-task-info-key` → `modelInfo`，只提取预算、能力和
+排队字段；同时核对 `hc.current.modelInfo` 的模型 ID 与渠道。脱敏字段快照见
+[DeepSeek 配置样本](codearts-agent-deepseek-config-2026-10-30.json)。
+
+两个条目 `deepseek-v4.1-flash`、`deepseek-v4.1-flash-1017` 的下列配置一致：
+
+| 原始字段 | 值 | 本次可确认的含义 |
+| --- | --- | --- |
+| `context_window` | 1048576 | 目录声明的上下文预算 |
+| `input_length` / `truncate_length` | 1044480 | 目录声明的输入及截断预算 |
+| `max_tokens` | 65536 | 当前输出预算的来源 |
+| `output_context_window` | 0 | 没有提供另一份正数输出预算；桌面端也会回退到 `max_tokens` |
+| `model_type`（顶层） | `admin` | 目录中的模型分类标记 |
+| `channel_source` / `provider` | `codearts` / `internal` | 目录来源标记，不代替请求的 `maas_type` |
+| `supported_clients` | `["all"]` | 该目录未把模型限定为某一客户端 |
+| `thinking_type` / `supported_thinking_strengths` | `null` / `[]` | 此记录没有声明推理档位，不能外推为模型厂商能力 |
+| `supports_images` / `supports_computer_use` | `false` / `false` | 此目录未声明图片或电脑操作能力 |
+| `is_tool_call_priority` | `true` | 工具调用优先标记，不是工具数量上限 |
+| `enable_queue` | `true` | 该目录启用了上游排队 |
+| `working_queue_length` / `waiting_queue_length` | 500 / 5000 | 排队配置值，不能当作单账号并发额度 |
+| `working_queue_timeout_s` | 600 | 上游目录中的排队超时字段，不要求代理等待相同时长 |
+
+本机当时选中 `deepseek-v4.1-flash`，未指定 `maas_type`；两个缓存条目也未标记
+`maas_type` 或 `is_free_benefit`。同次启动日志在 16:12:37（UTC+8）记录福利、教育
+开关的 HTTP 200 响应均为 `enabled=false`，教育另有 `is_student_certified=false`。
+这些是本机该次目录与渠道状态，不能外推到池中其他账号或后续刷新。
+
+本次没有发现修改客户端或切换权益头便可使用 384K 输出的配置依据。已有自动收窄
+逻辑与实际目录吻合，保持按账号、渠道读取预算；未修改推理代码或进行更高输出预算测试。
 
 ## 8. 脱敏
 

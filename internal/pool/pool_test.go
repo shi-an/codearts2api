@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,6 +10,52 @@ import (
 	"codearts2api/internal/auth"
 	"codearts2api/internal/upstream"
 )
+
+func TestPickExcludingPrefersIdleAccount(t *testing.T) {
+	p, err := New([]*auth.Auth{{UserID: "busy-pick"}, {UserID: "idle-pick"}}, Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.AcquireLock("busy-pick") {
+		t.Fatal("could not occupy first account")
+	}
+	defer p.ReleaseLock("busy-pick")
+	if got := p.PickExcluding(nil); got == nil || got.Name != "idle-pick" {
+		t.Fatalf("idle account ignored: %+v", got)
+	}
+}
+
+func TestAcquireLockWaitContextCancellationPreservesOtherSlot(t *testing.T) {
+	p, err := New([]*auth.Auth{{UserID: "cancel-wait"}}, Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.AcquireLock("cancel-wait") {
+		t.Fatal("could not occupy slot")
+	}
+	defer p.ReleaseLock("cancel-wait")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan bool, 1)
+	go func() { result <- p.AcquireLockWaitContext(ctx, "cancel-wait", time.Minute) }()
+	select {
+	case <-result:
+		t.Fatal("waiter returned while the slot was still held")
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case acquired := <-result:
+		if acquired {
+			t.Fatal("cancelled waiter acquired a slot")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("cancelled waiter did not stop")
+	}
+	if !p.Busy("cancel-wait") {
+		t.Fatal("cancelled waiter released another request's slot")
+	}
+}
 
 func TestAddAccountInitializesConcurrency(t *testing.T) {
 	p, err := New(nil, Config{MaxConcurrent: 1}, "")

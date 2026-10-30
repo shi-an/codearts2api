@@ -45,7 +45,7 @@ type Config struct {
 
 	// QueueRetrySeconds 上游并发/TPM 排队时的重试间隔（秒，默认 10）。
 	QueueRetrySeconds int `json:"queue_retry_seconds"`
-	// QueueMaxAttempts 排队重试次数上限（默认 30，约 5 分钟）。
+	// QueueMaxAttempts 包含首次请求的总尝试次数（默认 3，重试等待共 20 秒）。
 	QueueMaxAttempts int `json:"queue_max_attempts"`
 
 	// BenefitAutoClaim 模型发现时自动领取限时福利（默认 true）。

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,14 +27,14 @@ import (
 // Config handler 依赖。
 type Config struct {
 	Pool         *pool.Pool
-	Upstream     *upstream.Client
+	Upstream     ModelCatalogClient
 	APIKey       string
 	MaxRotate    int
 	SoftCooldown time.Duration
 	ErrThreshold int
 	ErrCooldown  time.Duration
 	// CodeArts 上游把并发会话/TPM 排队既可能返回 HTTP 400/429，
-	// 也可能嵌在 HTTP 200 SSE 内。默认每 10s 重试一次、最多 30 次（约 5 分钟）。
+	// 也可能嵌在 HTTP 200 SSE 内。默认总共尝试 3 次，之间等待 10s。
 	QueueRetryDelay  time.Duration
 	QueueMaxAttempts int
 	DefaultModel     string
@@ -65,12 +66,9 @@ type staticModel struct {
 
 // staticModels 静态兜底表：**只放实测确认可用的模型**。
 //
-// 上游的模型发现（agent-center / builtin）会列出当前账号未注册的模型，静态表
-// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-09-15 真实账号
-// 逐个调用验证（见 docs/reverse-engineering.md §7）：
-//
-//	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B
-//	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
+// 以下清单来自 2026-09-15 的历史验证，不代表当前账号的实时权限。
+// 2026-10-30 发现展示名与推理 ID 不同；历史上使用展示名得到的 not registered
+// 不能作为缺少权限的证据（见 docs/reverse-engineering.md §7）。新增模型依赖动态发现。
 var staticModels = []staticModel{
 	{ID: "GLM-5.2", ContextWindow: 202752},
 	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
@@ -131,9 +129,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.QueueRetryDelay = 10 * time.Second
 	}
 	if cfg.QueueMaxAttempts <= 0 {
-		// 上游并发/TPM 排队是瞬时的，但 180×10s = 30 分钟对交互式调用等于挂死；
-		// 取 30 次（约 5 分钟）作为默认，可用 queue_max_attempts 调整。
-		cfg.QueueMaxAttempts = 30
+		cfg.QueueMaxAttempts = 3
 	}
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = "glm-5.2"
@@ -418,9 +414,7 @@ func (h *Handler) modelList() []map[string]any {
 				kept = append(kept, e)
 			}
 		}
-		if len(kept) > 0 {
-			entries = kept
-		}
+		entries = kept
 	}
 	// 刚发现到的模型还没有可用性结论：后台补一轮探测，供后续请求过滤。
 	// （首次请求返回的是「发现结果」，之后才收敛到「真实可用」。）
@@ -457,6 +451,10 @@ func (h *Handler) modelKnownUnusable(model string) bool {
 		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
+		if upstream.AccountModelGatewayDisabled(acct.UID, model) {
+			anyKnown = true
+			continue
+		}
 		st, _ := modelAvailability(acct.UID, model)
 		if st == availUnknown {
 			return false // 还没结论，别急着下架
@@ -477,7 +475,7 @@ func (h *Handler) modelKnownUnusable(model string) bool {
 func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(infos)+len(staticModels))
 	seen := map[string]bool{}
-	add := func(id string, ctx, maxOut int64, benefit bool) {
+	add := func(id string, ctx, maxOut int64, channel string) {
 		if id == "" || seen[id] {
 			return
 		}
@@ -495,23 +493,28 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 		if maxOut > 0 {
 			entry["max_output_tokens"] = maxOut
 		}
-		if benefit {
+		if channel != "" {
 			entry["benefit"] = true
+			entry["maas_type"] = channel
 		}
 		out = append(out, entry)
 	}
 	// addAlias 精确 ID + 就近补一条小写别名（已是小写则跳过）。
-	addAlias := func(id string, ctx, maxOut int64, benefit bool) {
-		add(id, ctx, maxOut, benefit)
+	addAlias := func(id string, ctx, maxOut int64, channel string) {
+		add(id, ctx, maxOut, channel)
 		if lower := strings.ToLower(id); lower != id {
-			add(lower, ctx, maxOut, benefit)
+			add(lower, ctx, maxOut, channel)
 		}
 	}
-	for _, mi := range infos {
-		addAlias(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
+	for _, mi := range upstream.DefaultModels(infos) {
+		addAlias(mi.ID, mi.ContextWindow, mi.OutputLimit(), upstream.ModelChannel(mi))
 	}
 	for _, sm := range staticModels {
-		addAlias(sm.ID, sm.ContextWindow, 0, sm.Benefit)
+		channel := ""
+		if sm.Benefit {
+			channel = upstream.MaasBenefit
+		}
+		addAlias(sm.ID, sm.ContextWindow, 0, channel)
 	}
 	return out
 }
@@ -578,8 +581,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 // 3 次，池子超过 3 个账号时可能永远轮不到有能力的那台），又会给健康账号记错误、
 // 累计到阈值就冷却 10 分钟。所以按能力优先挑号。
 func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account {
-	want := strings.ToLower(upstream.CanonicalModel(model))
-	if acct := h.pickByCatalog(tried, want); acct != nil {
+	if acct := h.pickByCatalog(tried, model); acct != nil {
 		return acct
 	}
 	// 目录里没人登记这个模型。两种可能：① 谁都没有；② 目录还没发现
@@ -588,26 +590,65 @@ func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account
 	// （默认 3 次，账号多于 3 个时可能永远轮不到有能力的那台），还会给健康账号
 	// 记错误、到阈值冷却 10 分钟。所以先补齐缺失的目录再挑一次。
 	h.discoverMissingCatalogs(tried)
-	if acct := h.pickByCatalog(tried, want); acct != nil {
+	if acct := h.pickByCatalog(tried, model); acct != nil {
 		return acct
 	}
-	return h.cfg.Pool.PickExcluding(tried)
+	excluded := make(map[string]bool, len(tried))
+	for name, skip := range tried {
+		excluded[name] = skip
+	}
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct != nil && upstream.AccountModelGatewayDisabled(acct.UID, model) {
+			excluded[acct.Name] = true
+		}
+	}
+	return h.cfg.Pool.PickExcluding(excluded)
 }
 
-// pickByCatalog 在已发现目录的健康账号里挑第一个能服务该模型的。
-func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.Account {
+// pickReadyAccount 只挑空闲账号，优先选目录中有目标模型的，目录未知时乐观放行。
+// 热路径只读缓存，避免为了挑号同步拉取所有账号目录。
+func (h *Handler) pickReadyAccount(tried map[string]bool, model string) *pool.Account {
+	var unknown *pool.Account
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) || h.cfg.Pool.Busy(acct.Name) ||
+			upstream.AccountModelGatewayDisabled(acct.UID, model) {
+			continue
+		}
+		if st, _ := modelAvailability(acct.UID, model); st == availUnusable {
+			continue
+		}
+		if models, known := upstream.AccountModels(acct.UID); known {
+			if catalogHas(models, strings.ToLower(upstream.CanonicalModelForAccount(acct.UID, model))) {
+				return acct
+			}
+		} else if unknown == nil {
+			unknown = acct
+		}
+	}
+	return unknown
+}
+
+// pickByCatalog 在已发现目录的健康账号里挑能服务该模型的，优先空闲账号。
+func (h *Handler) pickByCatalog(tried map[string]bool, model string) *pool.Account {
+	var fallback *pool.Account
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
+		wantLower := strings.ToLower(upstream.CanonicalModelForAccount(acct.UID, model))
 		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, wantLower) {
 			if st, _ := modelAvailability(acct.UID, wantLower); st == availUnusable {
 				continue // 该账号实测调不通这个模型，别选它
 			}
-			return acct
+			if !h.cfg.Pool.Busy(acct.Name) {
+				return acct
+			}
+			if fallback == nil {
+				fallback = acct
+			}
 		}
 	}
-	return nil
+	return fallback
 }
 
 // discoverMissingCatalogs 为「目录未知或已过期」的健康账号补一次模型发现。
@@ -638,7 +679,7 @@ func (h *Handler) accountCanServe(acct *pool.Account, model string) bool {
 	if !known {
 		return true
 	}
-	return catalogHas(models, strings.ToLower(upstream.CanonicalModel(model)))
+	return catalogHas(models, strings.ToLower(upstream.CanonicalModelForAccount(acct.UID, model)))
 }
 
 // catalogHas 按小写 ID 在模型目录里查模型。
@@ -713,30 +754,52 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+		if r.Context().Err() != nil {
+			return
+		}
 		var acct *pool.Account
 		if stickyAcct != "" {
 			// 续接会话：锁定原账号（若仍健康）。
 			acct = h.cfg.Pool.Get(stickyAcct)
-			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) {
+			if acct == nil || tried[stickyAcct] || !h.cfg.Pool.Healthy(stickyAcct) ||
+				!h.accountCanServe(acct, model) || upstream.AccountModelGatewayDisabled(acct.UID, model) {
+				acct = nil
 				stickyAcct = ""
-				acct = h.cfg.Pool.PickExcluding(tried)
-			} else {
-				tried[acct.Name] = true
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.pickReadyAccount(tried, model)
+		}
+		if acct == nil {
+			acct = h.pickByCatalog(tried, model)
+		}
+		if acct == nil {
+			excluded := make(map[string]bool, len(tried))
+			for name, skip := range tried {
+				excluded[name] = skip
+			}
+			for _, a := range h.cfg.Pool.Accounts() {
+				if st, _ := modelAvailability(a.UID, model); st == availUnusable || upstream.AccountModelGatewayDisabled(a.UID, model) {
+					excluded[a.Name] = true
+				}
+			}
+			acct = h.cfg.Pool.PickExcluding(excluded)
 		}
 		if acct == nil {
 			break
 		}
 		tried[acct.Name] = true
 
-		// 阻塞等待并发槽位（上游单账号并发会话释放慢，串行最稳）。
-		// 超时 180s 排队（5 个请求 × ~30s 上限），避免高并发立即失败跳号。
-		if !h.cfg.Pool.AcquireLockWait(acct.Name, 180*time.Second) {
-			log.Printf("account %s concurrent limit reached after wait, trying next", acct.Name)
-			continue
+		// 有空闲账号时先分流；全忙时短暂排队，取消后不再占用等待资源。
+		if !h.cfg.Pool.AcquireLockWaitContext(r.Context(), acct.Name, 30*time.Second) {
+			if r.Context().Err() != nil {
+				return
+			}
+			lastErr = &upstream.ApiError{Status: http.StatusTooManyRequests, Message: "local account concurrency limit reached"}
+			if h.pickReadyAccount(tried, model) != nil {
+				continue
+			}
+			break
 		}
 
 		ok, verr := h.cfg.Pool.Validate(acct)
@@ -755,6 +818,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Pool.NeedKeepalive(acct.Name) {
 			h.cfg.Pool.PingKeepalive(acct.Name)
 		}
+		maxTokens := h.outputTokensForAccount(r.Context(), acct, model, req.MaxTokens)
+		if r.Context().Err() != nil {
+			h.cfg.Pool.ReleaseLock(acct.Name)
+			return
+		}
 
 		chatID := req.ConversationID
 		// 上游要求 chat_id 为 32 位十六进制（UUID 去连字符）；无显式 id 时每次新建。
@@ -770,23 +838,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		chatOpts := upstream.ChatOptions{
 			ReasoningEffort: req.ReasoningEffort,
-			MaxTokens:       req.MaxTokens,
+			MaxTokens:       maxTokens,
 			Temperature:     req.Temperature,
 			TopP:            req.TopP,
 			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
 		}
-		// 上游并发会话/TPM 排队是瞬时的。对齐 CodeArts Agent IDE
-		// 参考实现：默认每 10s 重试同一账号，最多 180 次（30min）。
-		// 等待期间释放并发锁，让排队的请求也能尝试（避免死锁式串行等待）。
+		// 等待重试时保留本请求的槽位，避免新请求同时撞上游并发限制。
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
-		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
 		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
-			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
+			rc, serr = acct.Client.ChatStreamForAccount(r.Context(), acct.UID, chatID, msgs, "", cred, model, chatOpts)
 			if serr == nil {
 				break
 			}
@@ -801,32 +866,51 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					}
 					authRetried = true
 					log.Printf("upstream 401 account=%s: token refreshed, retrying request once", acct.Name)
+					retry-- // 鉴权刷新不占用限流的重试预算。
 					continue
 				} else {
 					log.Printf("upstream 401 account=%s: refresh before retry failed: %v", acct.Name, rerr)
 				}
 			}
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
-				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
-				// 释放锁让其他请求有机会，等待后重新获取
-				h.cfg.Pool.ReleaseLock(acct.Name)
-				select {
-				case <-time.After(h.cfg.QueueRetryDelay):
-				case <-r.Context().Done():
-					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
-					return
-				}
-				if !h.cfg.Pool.AcquireLockWait(acct.Name, 30*time.Second) {
-					lastErr = errors.New("concurrent limit: could not reacquire lock after wait")
+				resolved := upstream.CanonicalModelForAccount(acct.UID, model)
+				if i+1 < h.cfg.MaxRotate && h.pickReadyAccount(tried, model) != nil {
+					log.Printf("upstream queue limit account=%s requested_model=%q resolved_model=%q: trying ready account", acct.Name, model, resolved)
 					break
+				}
+				if retry+1 >= h.cfg.QueueMaxAttempts || ae.RetryAfter > h.cfg.QueueRetryDelay {
+					log.Printf("upstream queue limit account=%s requested_model=%q resolved_model=%q: attempts=%d/%d, returning backpressure", acct.Name, model, resolved, retry+1, h.cfg.QueueMaxAttempts)
+					break
+				}
+				log.Printf("upstream queue limit retry=%d/%d account=%s requested_model=%q resolved_model=%q: %s; waiting %s", retry+1, h.cfg.QueueMaxAttempts-1, acct.Name, model, resolved, truncateMsg(ae.Message, 120), h.cfg.QueueRetryDelay)
+				timer := time.NewTimer(h.cfg.QueueRetryDelay)
+				select {
+				case <-timer.C:
+				case <-r.Context().Done():
+					timer.Stop()
+					h.cfg.Pool.ReleaseLock(acct.Name)
+					return
 				}
 				continue
 			}
 			break // 非并发错误，跳出重试
 		}
 		if serr != nil {
+			queueErr := queueLimitError(serr)
+			if r.Context().Err() == nil && queueErr != nil {
+				backoff := h.cfg.QueueRetryDelay
+				if queueErr.RetryAfter > backoff {
+					backoff = queueErr.RetryAfter
+				}
+				// 先设置退避再释放槽位，避免等待者趁两步之间的空隙发出新请求。
+				h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, backoff, "upstream queue limit")
+			}
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			if r.Context().Err() != nil {
+				return
+			}
 			if isParamInvalidError(serr) {
+				logRejectedParams(acct, model, msgs, chatOpts)
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
@@ -834,6 +918,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			lastErr = serr
+			if queueErr != nil {
+				continue
+			}
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
 				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
@@ -870,10 +957,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.PingKeepalive(acct.Name)
 			}, usage)
 			rc.Close()
+			queued := r.Context().Err() == nil && queueLimitError(werr) != nil
+			if queued {
+				h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.QueueRetryDelay, "upstream queue limit")
+			}
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				if !isParamInvalidError(werr) {
+				if isParamInvalidError(werr) {
+					logRejectedParams(acct, model, msgs, chatOpts)
+				}
+				if !queued && r.Context().Err() == nil && !isParamInvalidError(werr) {
 					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				}
 			} else {
@@ -884,14 +978,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		comp, aerr := upstream.AggregateRaw(rc)
 		rc.Close()
+		lateQueueErr := queueLimitError(aerr)
+		if r.Context().Err() == nil && lateQueueErr != nil {
+			h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.QueueRetryDelay, "upstream queue limit")
+		}
 		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 		if aerr != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			if isParamInvalidError(aerr) {
+				logRejectedParams(acct, model, msgs, chatOpts)
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
 				return
 			}
 			lastErr = aerr
+			if lateQueueErr != nil {
+				lastErr = lateQueueErr
+				continue
+			}
 			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
 			continue
 		}
@@ -916,6 +1022,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.NoteSuccess(acct.Name)
 
 		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
+		return
+	}
+	var queueErr *upstream.ApiError
+	if lastErr == nil {
+		if delay := h.cfg.Pool.QueueRetryAfter(); delay > 0 {
+			lastErr = &upstream.ApiError{Status: http.StatusTooManyRequests, RetryAfter: delay}
+		}
+	}
+	if errors.As(lastErr, &queueErr) && isQueueLimitError(queueErr) {
+		delay := h.cfg.QueueRetryDelay
+		if queueErr.RetryAfter > delay {
+			delay = queueErr.RetryAfter
+		}
+		seconds := int64(delay / time.Second)
+		if delay%time.Second != 0 {
+			seconds++
+		}
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "model "+model+" is temporarily rate or session limited; retry later")
 		return
 	}
 	msg := "all accounts unavailable (disabled/cooldown)"
@@ -1173,6 +1298,23 @@ func isQueueLimitError(err *upstream.ApiError) bool {
 	return (err.Status == http.StatusBadRequest && isConcurrentLimitError(low)) ||
 		strings.Contains(low, "inferhub.modelarts.81111.429") ||
 		strings.Contains(low, "tpm limit")
+}
+
+// queueLimitError 同时识别 HTTP 错误和已经开始输出的 SSE 中的限流事件。
+func queueLimitError(err error) *upstream.ApiError {
+	var apiErr *upstream.ApiError
+	if errors.As(err, &apiErr) && isQueueLimitError(apiErr) {
+		return apiErr
+	}
+	var streamErr *upstream.UpstreamError
+	if errors.As(err, &streamErr) {
+		message := streamErr.Code + " " + streamErr.Msg
+		low := strings.ToLower(message)
+		if isConcurrentLimitError(message) || strings.Contains(low, "429") || strings.Contains(low, "tpm limit") {
+			return &upstream.ApiError{Status: http.StatusTooManyRequests, Message: message, Path: upstream.EpChatV2}
+		}
+	}
+	return nil
 }
 
 func truncateMsg(s string, n int) string {

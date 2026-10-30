@@ -35,6 +35,12 @@ func main() {
 	if len(os.Args) > 3 {
 		model = os.Args[3]
 	}
+	// 与服务端一致，先发现账号渠道，避免把教育模型按默认福利路由发送。
+	if _, err := c.FetchModels(a); err != nil {
+		fmt.Fprintf(os.Stderr, "model discovery: %v\n", err)
+	}
+	model = upstream.CanonicalModelForAccount(a.UserID, model)
+	channel := upstream.AccountModelChannel(a.UserID, model)
 	chatID := fmt.Sprintf("%032x", time.Now().UnixNano())[:32]
 	fmt.Println("chat_id=", chatID, "user=", a.UserName, "uid=", a.UserID, "msg=", msg, "mode=", mode)
 
@@ -46,23 +52,23 @@ func main() {
 			"stream":   true,
 			"messages": []any{map[string]any{"role": "user", "content": msg}},
 		}
-		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
+		rc, err = c.SendChatV2WithChannel(context.Background(), body, "", cred, cred.SecurityToken, channel)
 	case "raw-text":
 		body := map[string]any{
 			"model":    model,
 			"stream":   true,
 			"messages": []any{map[string]any{"role": "user", "content": msg}},
 		}
-		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
+		rc, err = c.SendChatV2WithChannel(context.Background(), body, "", cred, cred.SecurityToken, channel)
 	case "raw-blocks":
 		body := map[string]any{
 			"model":    model,
 			"stream":   true,
 			"messages": []any{map[string]any{"role": "user", "content": msg}},
 		}
-		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
+		rc, err = c.SendChatV2WithChannel(context.Background(), body, "", cred, cred.SecurityToken, channel)
 	default:
-		rc, err = c.ChatStream(context.Background(), chatID, []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, a.UserName, model, upstream.IsBenefitModel(a.UserID, model))
+		rc, err = c.ChatStreamForAccount(context.Background(), a.UserID, chatID, []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, model, upstream.ChatOptions{})
 	}
 	if err != nil {
 		panic(err)

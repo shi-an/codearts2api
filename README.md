@@ -62,40 +62,113 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 指定函数不存在或重复定义时返回 400。上游 `InferHub.001001005` 参数错误也返回 400，
 不轮换、不冷却账号；若流式响应已开始，则用 SSE 错误事件结束，同样不处罚账号。
 
-### 模型列表与限时福利
+### 排队、限流与 sub2api 映射
 
-`/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`Qwen3-VL-235B`），
-同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。限时福利
-（免费套餐）模型额外带 `benefit: true` 标记，聊天时服务端会自动追加上游要求的
-`maas_type: benefit` 请求头（按发起请求的账号判定，多账号套餐不同也不会串——
-列表是各账号可用模型的并集，实际路由会优先挑目录里真有这个模型的账号）。
+单账号默认并发为 **1**。早期示例配置写了 `max_concurrent: 5`，已有部署需手动改成 1；
+更新源码不会覆盖挂载的 `config.json`。
+
+```jsonc
+"max_concurrent": 1,
+"queue_max_attempts": 3,   // 包含首次请求，默认最多等待两次，每次 10 秒
+"queue_retry_seconds": 10
+```
+
+等待上游重试时保留本请求的并发槽位，客户端取消即停止。遇到限流时有其他空闲且
+目录匹配（或目录未知）的账号会优先切换；最后一次失败后不再等待，返回 HTTP 429
+及 `Retry-After`。上游要求更长的等待时直接回传退避，不提前重试。账号只作短暂限流
+退避，不累计故障计数或进入 10 分钟错误冷却。本地槽位等待最多 30 秒，且响应客户端取消。
+
+sub2api 的映射目标须填写实际模型 ID，例如 `deepseek-v4.1-flash-1017`；版本后缀会
+完整保留，服务不会自动替换成 `deepseek-v4.1-flash`。两个 ID 的可用性与参数要求
+应分别验证。映射后失败时，先用目标 ID 直接请求以区分映射路径与目标模型问题。
+
+参数 400 会记录一行 `upstream params rejected ... request_shape={...}`，仅含模型、
+渠道、生成参数和消息/工具数量，不含正文、工具定义或凭据。可用它核对 `requested_model`、
+`resolved_model`、`reasoning_effort`、`max_tokens` 与已发现的 `model_output_limit` 及其来源。
+排队日志也会保留上游错误摘要，用于区分 TPM 限流和并发会话限制。
+
+### 输出预算与参数 400
+
+输出预算遵循**当前账号所选渠道的 CodeArts 模型目录**。与桌面客户端 0.2.6 一致，
+优先使用正数 `output_context_window`，缺失时回退到 `max_tokens`；已知预算也会通过
+`/v1/models` 的 `max_output_tokens` 返回。带输出预算的聊天请求遇到目录缺失或过期时，
+只为所选账号补查一次，最多等待 10 秒；并发聊天合并发现，失败后退避 5 分钟。
+
+`max_tokens` / `max_completion_tokens` 超过目录声明的预算时会自动收窄，并记录
+`max_tokens capped ... channel=... limit_source=... requested_max_tokens=... effective_max_tokens=...`。
+换账号时重新按原始预算计算；未传预算或渠道未提供预算时保持原样，不推测固定上限。
+
+2026-10-30 本地 Agent IDE 26.10.100 日志中，`deepseek-v4.1-flash` 与
+`deepseek-v4.1-flash-1017` 的配置均为 1M 上下文、65536 输出预算。IDE 直接读取
+`max_tokens`，桌面端则优先读取 `output_context_window`，因此两者可能显示不同预算。
+这份 IDE 日志**不能证明服务端固定限制为 64K，也没有确认它就是参数 400 的根因**；
+同样，DeepSeek 直连 API 的 384K 规格不能证明当前 CodeArts 账号或渠道支持该数值。
+
+继续只读核对官方 IDE 的模型目录缓存后，两个 DeepSeek 条目的原始字段均为
+`max_tokens=65536`、`output_context_window=0`、`context_window=1048576`、
+`input_length=1044480`。因此桌面端字段优先级在这份目录上也会回退到 65536，
+目前没有发现可改用的更高输出预算。该缓存中的条目未标权益渠道；本机选中模型的
+`maas_type` 也为空。账号和时间不同，目录仍可能变化。
+
+2026-10-30 部署复测：用户确认更新代理后，由代理自动收窄到 64K 的请求已正常返回。
+这验证了本次输出预算调整在该部署中有效；尚未测试服务端可接受的精确最大值。
+
+参数 400 的诊断同时记录原始 `model_max_tokens`、`model_output_context_window`、
+实际采用的 `model_output_limit` / `model_output_limit_source` 及 `model_context_window`。
+若仍被拒绝，需结合这些字段继续核对工具定义和消息格式；工具或消息数量本身不足以定因。
+
+### 模型列表与客户端权益渠道
+
+`/v1/models` 返回上游**精确推理 ID**（区分大小写，如 `GLM-5.2`、`glm-5.3`），
+同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。
+展示名可能与推理 ID 不同：官方 Agent 26.10.100 的 `GLM-5.3` 实际调用 `glm-5.3`，
+`GLM-5.2-ArkTS-SPARK` 实际调用 `glm-5.2-sft-harmony`。发现时优先读取
+`model_parameters.model_id`，并按实际账号解析展示名及大小写，避免其他账号覆盖调用 ID。
+
+福利和教育渠道模型额外带 `benefit: true` 及 `maas_type: benefit / education` 标记。
+列表是各账号模型的并集；聊天与探测均按实际使用账号的目录解析渠道，在签名前追加
+上游要求的 `maas_type` 请求头。
+
+同 ID 的普通、福利和教育记录独立保存，预算不跨渠道拼接。只提供模型 ID 时，
+与官方 IDE 的普通目录优先规则一致：先选普通记录；没有普通记录时，沿用
+`benefit → education` 的兼容顺序，路由与预算一起选择。`/v1/models` 每个 ID 展示
+默认记录，探测每个默认记录一次；可用性缓存按账号、模型和渠道隔离。
+`cmd/models -json -claim=false` 可查看所有渠道的原始参数。
+
+CodeArts 网页端使用 `/chat/.../cloudagent/sessions/.../messages` 的会话协议；
+Agent IDE 与桌面客户端使用 `/api/v2/chat/completions`。本项目沿用客户端协议。
+网页会话成功不能直接证明兼容 API 的某组生成参数有效；当前尚未确认网页端的输出预算。
 
 福利模型列表随免费套餐轮换，用下面这条命令核对当前账号实际可用的模型：
 
 ```bash
-go run ./cmd/models                 # 账号可用模型（内置 + 福利）
+go run ./cmd/models                 # 账号模型（内置 + 已启用的福利/教育渠道）
 go run ./cmd/models -json           # 机器可读
-go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，属写操作）
+go run ./cmd/models -claim          # 仅对已启用渠道领取后查询（幂等，属写操作）
+go run ./cmd/models -claim=false    # 不自动领取，仍查询已启用渠道
 ```
 
-限时福利模型**必须先领取才能调用**：未领取时上游一律返回
-`InferHub.4004.200 benefit not found`（实测）。领取是幂等操作，官方客户端打开模型
-菜单时也会调用，因此服务默认会领取（`benefit_auto_claim: true`）。不想让服务写账号
-可显式关闭：
+对齐 CodeArts 桌面客户端 0.2.6：先查询 `/v1/benefit-gateway-config` 与
+`/v1/education-gateway-config`，只有 `enabled=true` 才查询相应模型并自动领取。
+**关闭渠道不会调用旧领取接口，也不会从静态种子补回过期福利模型**；这不代表普通
+内置模型停用。开关或模型接口临时失败时保留上次已确认的渠道模型；业务错误不会被当作关闭。
+
+尚未领取或已经过期的权益可能返回 `InferHub.4004.200 benefit not found`。服务默认
+自动领取已启用渠道（`benefit_auto_claim: true`）；不想让服务写账号可显式关闭：
 
 ```jsonc
 "benefit_auto_claim": false   // 或 CA2A_BENEFIT_AUTO_CLAIM=0
 ```
 
-关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
+关闭自动领取不影响已领取的有效权益。模型是否能调用仍取决于当前账号权限、额度及探测结果。
 
 ### 模型可用性探测
 
-`/v1/models` 只列**真实可用**的模型：上游的模型发现（agent-center / builtin / 福利
-网关）会列出当前账号根本没注册的模型（实测 `GLM-5.2-ArkTS-SPARK`、`OpenPangu-2.0-Pro`
-等返回 `InferHub.002002009.404`）。服务会周期性用一条最小请求探测并缓存结论，
-真实请求失败也会被学习（`not registered` / `benefit not found` 记为账号能力问题，
-不会给健康账号记错误冷却）。探测结果缓存 30 分钟。
+`/v1/models` 会过滤已确认不可用的模型；尚未探测的条目仍会保留。服务周期性用一条
+最小请求探测，真实请求的结果也会写入缓存，展示名与推理 ID 共用同一账号的结论。
+`InferHub.002002009.404 / not registered` 也可能由错误 ID、大小写或渠道导致，
+**不能仅凭这条错误判断账号需要注册模型**。官方客户端能回复而代理失败时，应先核对
+模型映射与渠道。模型错误不会给健康账号记错误冷却；探测结果缓存 30 分钟。
 
 ### API Key 必填
 
@@ -164,7 +237,9 @@ docker compose up -d --build
 | `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `30` |
 | `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `30` |
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
-| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
+| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `1` |
+| `CA2A_QUEUE_MAX_ATTEMPTS` | 包含首次请求的上游总尝试次数 | `3` |
+| `CA2A_QUEUE_RETRY_SECONDS` | 两次上游尝试之间的等待秒数 | `10` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |

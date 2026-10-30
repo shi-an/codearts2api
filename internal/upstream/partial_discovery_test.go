@@ -24,3 +24,39 @@ func TestPartialDiscoveryKeepsBenefit(t *testing.T) {
 		t.Error("模型转正后应摘掉福利标记")
 	}
 }
+
+func TestPartialDiscoveryKeepsSameIDChannelsSeparate(t *testing.T) {
+	const model = "partial-channel-shared"
+	acct := t.Name()
+	SetAccountModels(acct, []ModelInfo{
+		{ID: model, MaasType: MaasBenefit, MaxTokens: 8192},
+		{ID: model, MaasType: MaasEducation, OutputContextWindow: 32768},
+	})
+	// 两路暂时失败：同时保留，不能用同一个 ID 键覆盖其中一条。
+	setAccountChannelModels(acct, nil, map[string]bool{MaasBenefit: true, MaasEducation: true}, nil)
+	infos, _ := AccountModels(acct)
+	if len(infos) != 2 || infos[0].OutputLimit() != 8192 || infos[1].OutputLimit() != 32768 {
+		t.Fatalf("failed channels overwrote each other: %+v", infos)
+	}
+	// 普通模型出现时优先选普通记录，未知预算不得从历史权益记录补齐。
+	setAccountChannelModels(acct, []ModelInfo{{ID: model}}, map[string]bool{MaasBenefit: true, MaasEducation: true}, nil)
+	info, ok := AccountModelInfo(acct, model)
+	if !ok || ModelChannel(info) != "" || info.OutputLimit() != 0 {
+		t.Fatalf("cached entitlement metadata leaked into ordinary record: %+v", info)
+	}
+	// 福利关闭只移除福利；随后失败也不能把关闭渠道复活。
+	for i := 0; i < 2; i++ {
+		setAccountChannelModels(acct, nil, map[string]bool{MaasBenefit: true, MaasEducation: true}, map[string]bool{MaasBenefit: false})
+		info, _ = AccountModelInfo(acct, model)
+		infos, _ = AccountModels(acct)
+		if len(infos) != 1 || ModelChannel(info) != MaasEducation || info.OutputLimit() != 32768 {
+			t.Fatalf("closed benefit displaced education record: %+v", infos)
+		}
+	}
+	// 教育来源成功返回空目录后，下一轮临时失败不得复活已删除的条目。
+	setAccountChannelModels(acct, nil, nil, nil)
+	setAccountChannelModels(acct, nil, map[string]bool{MaasEducation: true}, nil)
+	if infos, _ := AccountModels(acct); len(infos) != 0 {
+		t.Fatalf("removed channel entries resurrected: %+v", infos)
+	}
+}

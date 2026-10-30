@@ -3,7 +3,7 @@
 // 三路合并（与官方 ModelService 对齐）：
 //  1. agent-center detail 的 gpts.models
 //  2. GET /v1/model/builtin（PromptCenter）
-//  3. 福利网关 GET opengw/api/v1/gateway/config（默认只读；-claim 时先领取）
+//  3. 权益渠道开关启用后 GET opengw/api/v1/gateway/config（默认自动领取）
 //
 // 用法：go run ./cmd/models [-auth-dir ./auths] [-json] [-claim]
 package main
@@ -23,7 +23,7 @@ import (
 func main() {
 	authDir := flag.String("auth-dir", "./auths", "auth dir")
 	jsonOut := flag.Bool("json", false, "raw JSON output")
-	claim := flag.Bool("claim", true, "领取限时福利再查询（幂等；-claim=false 可跳过）")
+	claim := flag.Bool("claim", true, "仅对已启用的福利/教育渠道领取权益（幂等；-claim=false 可跳过）")
 	flag.Parse()
 
 	auths, err := auth.LoadDir(*authDir)
@@ -36,7 +36,7 @@ func main() {
 	c := upstream.New(60 * time.Second)
 	c.SetBenefitAutoClaim(*claim)
 	if *claim {
-		log.Printf("benefit auto claim enabled: 将向福利网关提交领取请求")
+		log.Printf("benefit auto claim enabled: 仅向已启用的权益渠道提交领取请求")
 	}
 	for _, a := range auths {
 		infos, err := c.FetchModels(a)
@@ -62,15 +62,15 @@ func main() {
 		fmt.Printf("== %s (%s): %d models (%d benefit)\n", a.UserID, a.UserName, len(infos), benefits)
 		for _, m := range infos {
 			tag := "builtin"
-			if m.Benefit {
-				tag = "benefit"
+			if channel := upstream.ModelChannel(m); channel != "" {
+				tag = channel
 			}
-			fmt.Printf("  [%-7s] %-28s ctx=%-8d max=%-8d %s\n",
-				tag, m.ID, m.ContextWindow, m.MaxTokens, m.Desc)
+			fmt.Printf("  [%-9s] %-28s ctx=%-8d output=%-8d source=%-21s %s\n",
+				tag, m.ID, m.ContextWindow, m.OutputLimit(), m.OutputLimitSource(), m.Desc)
 		}
 	}
 	if !*claim && !*jsonOut {
 		// 走 stderr：stdout 要保持机器可读（-json）。
-		fmt.Fprintln(os.Stderr, "提示：福利模型为空时可加 -claim 领取限时福利后重试。")
+		fmt.Fprintln(os.Stderr, "提示：仅在权益渠道已启用但尚未领取时，才需加 -claim 重试。")
 	}
 }

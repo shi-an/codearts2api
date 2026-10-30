@@ -14,11 +14,9 @@ import (
 
 // 模型可用性探测。
 //
-// 背景（2026-09-15 实测）：上游 /v1/models 的发现结果 ≠ 账号真能调用的模型。
-// agent-center 与 /v1/model/builtin 会列出未在当前账号注册的模型（实测
-// GLM-5.2-ArkTS-SPARK / OpenPangu-2.0-Pro / OpenPangu-2.0-Flash 全部返回
-// InferHub.002002009.404），福利模型在未领取时返回 InferHub.4004.200
-// benefit not found。只按发现结果列模型，客户端会拿到一堆必然失败的条目。
+// 发现结果不保证当前账号实际可调用；福利未领取时也可能返回 benefit not found。
+// not registered 还可能由错误的模型 ID、大小写或渠道导致，不能据此要求用户注册模型。
+// 探测与真实聊天必须使用同一账号的精确推理 ID 和渠道。
 //
 // 因此这里做一次轻量真实探测（一条最小 chat 请求），把结果缓存起来：
 //   - /v1/models 过滤掉已知不可用的模型
@@ -66,7 +64,7 @@ var probesStop = make(chan struct{})
 
 var availability = struct {
 	sync.Mutex
-	byKey     map[string]availEntry // accountID|modelLower -> 状态
+	byKey     map[string]availEntry // accountID|modelLower|channel -> 状态
 	probing   map[string]bool       // 正在探测的 key（去重）
 	sweeping  bool                  // 是否已有一轮后台批量探测在跑
 	lastSweep time.Time
@@ -77,14 +75,15 @@ var availability = struct {
 }{byKey: map[string]availEntry{}, probing: map[string]bool{}, lastTraffic: map[string]time.Time{}}
 
 func availKey(accountID, model string) string {
-	return accountID + "|" + strings.ToLower(model)
+	return accountID + "|" + strings.ToLower(upstream.CanonicalModelForAccount(accountID, model)) + "|" + upstream.AccountModelChannel(accountID, model)
 }
 
 // modelAvailability 返回缓存的可用性；过期视为未知。
 func modelAvailability(accountID, model string) (availState, string) {
+	key := availKey(accountID, model)
 	availability.Lock()
 	defer availability.Unlock()
-	e, ok := availability.byKey[availKey(accountID, model)]
+	e, ok := availability.byKey[key]
 	if !ok || time.Since(e.at) > availabilityTTL {
 		return availUnknown, ""
 	}
@@ -96,9 +95,10 @@ func markUnusable(accountID, model, reason string) {
 	if accountID == "" || model == "" {
 		return
 	}
+	key := availKey(accountID, model)
 	availability.Lock()
 	defer availability.Unlock()
-	availability.byKey[availKey(accountID, model)] = availEntry{state: availUnusable, reason: reason, at: time.Now()}
+	availability.byKey[key] = availEntry{state: availUnusable, reason: reason, at: time.Now()}
 }
 
 // markUsable 记录某账号下某模型可用。
@@ -106,9 +106,10 @@ func markUsable(accountID, model string) {
 	if accountID == "" || model == "" {
 		return
 	}
+	key := availKey(accountID, model)
 	availability.Lock()
 	defer availability.Unlock()
-	availability.byKey[availKey(accountID, model)] = availEntry{state: availUsable, at: time.Now()}
+	availability.byKey[key] = availEntry{state: availUsable, at: time.Now()}
 }
 
 // noteTraffic 记录账号上一次真实请求时间（探测据此避让）。
@@ -140,7 +141,7 @@ func upstreamUnavailableReason(err error) string {
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "002002009") || strings.Contains(msg, "not registered"):
-		return "模型未在当前账号注册"
+		return "上游未识别模型 ID 或路由（not registered；请核对模型映射和渠道）"
 	case strings.Contains(msg, "4004.200") || strings.Contains(msg, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
 	}
@@ -184,12 +185,12 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	body := map[string]any{
-		"model":    upstream.CanonicalModel(model),
+		"model":    upstream.CanonicalModelForAccount(acct.UID, model),
 		"stream":   true,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	}
-	rc, err := acct.Client.SendChatV2(ctx, body, "", cred, cred.SecurityToken,
-		upstream.IsBenefitModel(acct.UID, model))
+	rc, err := acct.Client.SendChatV2WithChannel(ctx, body, "", cred, cred.SecurityToken,
+		upstream.AccountModelChannel(acct.UID, model))
 	if err != nil {
 		// 并发上限是暂时的，不代表模型不可用。
 		if strings.Contains(err.Error(), "TM.00001041") {
@@ -232,7 +233,7 @@ func upstreamUnavailableReasonText(s string) string {
 	low := strings.ToLower(s)
 	switch {
 	case strings.Contains(low, "002002009") || strings.Contains(low, "not registered"):
-		return "模型未在当前账号注册"
+		return "上游未识别模型 ID 或路由（not registered；请核对模型映射和渠道）"
 	case strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
 	}
@@ -298,7 +299,7 @@ func (h *Handler) pendingProbes() []pendingProbe {
 		if !ok {
 			continue
 		}
-		for _, mi := range models {
+		for _, mi := range upstream.DefaultModels(models) {
 			if st, _ := modelAvailability(acct.UID, mi.ID); st != availUnknown {
 				continue
 			}
