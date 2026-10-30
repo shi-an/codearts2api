@@ -16,7 +16,9 @@
   "benefit_auto_claim": true,    // 模型发现时自动领取限时福利（幂等；关闭则福利模型调用必然失败）
   "credits_auto_claim": true,    // watchdog 自动领取每日签到/新手活动积分；与模型 Token 福利独立
   // "login_client_id": "codearts-agent",  // WebUI 登录用 OAuth client；留空自动沿用已有账号的取值
-  "max_concurrent": 5,           // 单账号最大并发数（默认 5）
+  "max_concurrent": 1,           // 单账号串行，减少上游会话槽位尚未释放导致的并发错误
+  "queue_max_attempts": 3,        // 包含首次请求；耗尽返回 429，不继续等待
+  "queue_retry_seconds": 10,      // 两次尝试之间等待；期间保留本请求的并发槽位
   "keepalive_window": "10m",     // 保活心跳窗口，超过此时间无活动则发送心跳（默认 10m）
   "watch": {
     "enabled": true,

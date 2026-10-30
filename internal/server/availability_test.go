@@ -134,11 +134,11 @@ func TestProbeGapExists(t *testing.T) {
 // 排队重试不能无限等：默认值应远小于原来的 180×10s=30min。
 func TestQueueRetryDefaultBounded(t *testing.T) {
 	h := NewHandler(Config{})
-	total := time.Duration(h.cfg.QueueMaxAttempts) * h.cfg.QueueRetryDelay
-	if total > 10*time.Minute {
+	total := time.Duration(h.cfg.QueueMaxAttempts-1) * h.cfg.QueueRetryDelay
+	if total > 30*time.Second {
 		t.Fatalf("排队重试上限 %s 过长，交互式请求会像挂死", total)
 	}
-	if total < time.Minute {
+	if total < 10*time.Second {
 		t.Fatalf("排队重试上限 %s 过短，瞬时的上游排队会直接失败", total)
 	}
 }

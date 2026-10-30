@@ -57,7 +57,7 @@ type Config struct {
 	ErrCooldown     time.Duration
 	SoftCooldown    time.Duration
 	RefreshSkew     time.Duration        // token 到期前多久自动刷新
-	MaxConcurrent   int                  // 单账号最大并发数（默认 5）
+	MaxConcurrent   int                  // 单账号最大并发数（默认 1）
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
@@ -299,23 +299,30 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.accounts = next
 }
 
-// PickExcluding 挑一个健康账号。
+// PickExcluding 优先挑有空闲槽位的健康账号，全忙时返回第一个健康账号供调用方排队。
 func (p *Pool) PickExcluding(tried map[string]bool) *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	var fallback *Account
 	for _, a := range p.accounts {
 		if tried != nil && tried[a.Name] {
 			continue
 		}
 		a.mu.Lock()
 		healthy := !a.disabled && now.After(a.coolUntil)
+		ready := a.activeConcurrent < a.maxConcurrent
 		a.mu.Unlock()
 		if healthy {
-			return a
+			if ready {
+				return a
+			}
+			if fallback == nil {
+				fallback = a
+			}
 		}
 	}
-	return nil
+	return fallback
 }
 
 // Validate 校验并（必要时）自动刷新 token。带 5 分钟缓存。
@@ -462,6 +469,23 @@ func (p *Pool) Healthy(name string) bool {
 	return false
 }
 
+// QueueRetryAfter 返回启用账号中最早结束的上游限流退避，供调用方返回 Retry-After。
+func (p *Pool) QueueRetryAfter() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var remaining time.Duration
+	for _, a := range p.accounts {
+		a.mu.Lock()
+		delay := time.Until(a.coolUntil)
+		queued := !a.disabled && a.coolKind == CoolSoft && a.lastErr == "upstream queue limit"
+		a.mu.Unlock()
+		if queued && delay > 0 && (remaining == 0 || delay < remaining) {
+			remaining = delay
+		}
+	}
+	return remaining
+}
+
 // Enabled 报告账号是否启用；冷却期间仍需续期。
 func (p *Pool) Enabled(name string) bool {
 	a := p.Get(name)
@@ -513,20 +537,33 @@ func (p *Pool) ReleaseLock(name string) {
 
 // AcquireLockWait 阻塞等待账号并发槽位，超时返回 false。
 //
-// 上游单账号并发会话上限 3，本池 maxConcurrent 默认 2 留余量。
+// maxConcurrent 默认 1，避免已结束的上游会话尚未释放时挤占更多槽位。
 // 高并发请求在此排队等待槽位释放，而非立即失败跳号。
 // timeout=0 时等价于非阻塞 AcquireLock。
 func (p *Pool) AcquireLockWait(name string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+	return p.AcquireLockWaitContext(context.Background(), name, timeout)
+}
+
+// AcquireLockWaitContext 在客户端取消、账号停用或超时时停止等待，不修改其他请求的槽位。
+func (p *Pool) AcquireLockWaitContext(ctx context.Context, name string, timeout time.Duration) bool {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	for {
+		if ctx.Err() != nil {
+			return false
+		}
 		p.mu.Lock()
-		acquired := false
+		acquired, healthy := false, false
 		for _, a := range p.accounts {
 			if a.Name != name {
 				continue
 			}
 			a.mu.Lock()
-			if a.activeConcurrent < a.maxConcurrent {
+			healthy = !a.disabled && time.Now().After(a.coolUntil)
+			if healthy && ctx.Err() == nil && a.activeConcurrent < a.maxConcurrent {
 				a.activeConcurrent++
 				acquired = true
 			}
@@ -537,11 +574,17 @@ func (p *Pool) AcquireLockWait(name string, timeout time.Duration) bool {
 		if acquired {
 			return true
 		}
-		if timeout <= 0 || time.Now().After(deadline) {
+		if !healthy || timeout <= 0 {
 			return false
 		}
 		// 避免忙轮询：每次 100ms 重试。
-		time.Sleep(100 * time.Millisecond)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
 	}
 }
 

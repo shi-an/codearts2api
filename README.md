@@ -62,6 +62,31 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 指定函数不存在或重复定义时返回 400。上游 `InferHub.001001005` 参数错误也返回 400，
 不轮换、不冷却账号；若流式响应已开始，则用 SSE 错误事件结束，同样不处罚账号。
 
+### 排队、限流与 sub2api 映射
+
+单账号默认并发为 **1**。早期示例配置写了 `max_concurrent: 5`，已有部署需手动改成 1；
+更新源码不会覆盖挂载的 `config.json`。
+
+```jsonc
+"max_concurrent": 1,
+"queue_max_attempts": 3,   // 包含首次请求，默认最多等待两次，每次 10 秒
+"queue_retry_seconds": 10
+```
+
+等待上游重试时保留本请求的并发槽位，客户端取消即停止。遇到限流时有其他空闲且
+目录匹配（或目录未知）的账号会优先切换；最后一次失败后不再等待，返回 HTTP 429
+及 `Retry-After`。上游要求更长的等待时直接回传退避，不提前重试。账号只作短暂限流
+退避，不累计故障计数或进入 10 分钟错误冷却。本地槽位等待最多 30 秒，且响应客户端取消。
+
+sub2api 的映射目标须填写实际模型 ID，例如 `deepseek-v4.1-flash-1017`；版本后缀会
+完整保留，服务不会自动替换成 `deepseek-v4.1-flash`。两个 ID 的可用性与参数要求
+应分别验证。映射后失败时，先用目标 ID 直接请求以区分映射路径与目标模型问题。
+
+参数 400 会记录一行 `upstream params rejected ... request_shape={...}`，仅含模型、
+渠道、生成参数和消息/工具数量，不含正文、工具定义或凭据。可用它核对 `requested_model`、
+`resolved_model`、`reasoning_effort`、`max_tokens` 与已发现的 `model_max_tokens`。
+排队日志也会保留上游错误摘要，用于区分 TPM 限流和并发会话限制。
+
 ### 模型列表与客户端权益渠道
 
 `/v1/models` 返回上游**精确推理 ID**（区分大小写，如 `GLM-5.2`、`glm-5.3`），
@@ -172,7 +197,9 @@ docker compose up -d --build
 | `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `30` |
 | `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `30` |
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
-| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
+| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `1` |
+| `CA2A_QUEUE_MAX_ATTEMPTS` | 包含首次请求的上游总尝试次数 | `3` |
+| `CA2A_QUEUE_RETRY_SECONDS` | 两次上游尝试之间的等待秒数 | `10` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |

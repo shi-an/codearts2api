@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,10 +30,11 @@ import (
 
 // ApiError 带业务 code 的上游错误。
 type ApiError struct {
-	Code    int
-	Status  int
-	Message string
-	Path    string
+	Code       int
+	Status     int
+	Message    string
+	Path       string
+	RetryAfter time.Duration
 }
 
 func (e *ApiError) Error() string {
@@ -602,9 +604,24 @@ func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID st
 	if resp.StatusCode >= 400 {
 		rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 200), Path: EpChatV2}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 200), Path: EpChatV2, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 	}
-	return preflightSSE(resp.Body)
+	rc, err := preflightSSE(resp.Body)
+	if apiErr, ok := err.(*ApiError); ok {
+		apiErr.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+	}
+	return rc, err
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(value, 10, 32); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
 }
 
 type replayReadCloser struct {
