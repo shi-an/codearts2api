@@ -20,8 +20,8 @@ func channelURL(endpoint, channel string) string {
 
 // fetchChannelModels 先查策略中心开关，只有 enabled=true 才领取及发现模型。
 // enabled=nil 表示尚未确认，不能据此关闭账号的已知渠道或删除已有路由。
-func (c *Client) fetchChannelModels(accountID string, cred SignCredential, channel string) ([]ModelInfo, *bool, error) {
-	enabled, err := c.fetchGatewayEnabled(accountID, cred, channel)
+func (c *Client) fetchChannelModels(ctx context.Context, accountID string, cred SignCredential, channel string) ([]ModelInfo, *bool, error) {
+	enabled, err := c.fetchGatewayEnabled(ctx, accountID, cred, channel)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -29,11 +29,11 @@ func (c *Client) fetchChannelModels(accountID string, cred SignCredential, chann
 		Log("%s gateway disabled, skipping claim and models", channel)
 		return nil, &enabled, nil
 	}
-	infos, err := c.fetchGatewayModels(accountID, cred, channel)
+	infos, err := c.fetchGatewayModels(ctx, accountID, cred, channel)
 	return infos, &enabled, err
 }
 
-func (c *Client) fetchGatewayEnabled(accountID string, cred SignCredential, channel string) (bool, error) {
+func (c *Client) fetchGatewayEnabled(ctx context.Context, accountID string, cred SignCredential, channel string) (bool, error) {
 	path := EpBenefitGateway
 	if channel == MaasEducation {
 		path = EpEducationGateway
@@ -42,7 +42,7 @@ func (c *Client) fetchGatewayEnabled(accountID string, cred SignCredential, chan
 	if c.srcBlocked(key) {
 		return false, fmt.Errorf("%s gateway backoff", channel)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.snapURL(path), nil)
 	if err != nil {

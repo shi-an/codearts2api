@@ -188,7 +188,7 @@ func TestGatewayFailureIsNotDisabled(t *testing.T) {
 			defer srv.Close()
 			c := New(time.Second)
 			c.snapBase = srv.URL
-			_, enabled, err := c.fetchChannelModels("unknown-gateway", SignCredential{}, MaasBenefit)
+			_, enabled, err := c.fetchChannelModels(context.Background(), "unknown-gateway", SignCredential{}, MaasBenefit)
 			if err == nil || enabled != nil {
 				t.Fatalf("failed gateway was interpreted as closed: enabled=%v err=%v", enabled, err)
 			}
@@ -208,7 +208,7 @@ func TestChannelConfigRequiresModelsArray(t *testing.T) {
 	c := New(time.Second)
 	c.SetBenefitAutoClaim(false)
 	c.snapBase, c.benefitBase = srv.URL, srv.URL
-	_, enabled, err := c.fetchChannelModels("malformed-models", SignCredential{}, MaasBenefit)
+	_, enabled, err := c.fetchChannelModels(context.Background(), "malformed-models", SignCredential{}, MaasBenefit)
 	if err == nil || enabled == nil || !*enabled {
 		t.Fatalf("malformed model list must be a source failure, enabled=%v err=%v", enabled, err)
 	}

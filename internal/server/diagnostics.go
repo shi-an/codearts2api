@@ -15,19 +15,20 @@ func logRejectedParams(acct *pool.Account, model string, messages []upstream.Cha
 
 func rejectedParamsShape(accountID, model string, messages []upstream.ChatMessage, opts upstream.ChatOptions) string {
 	shape := struct {
-		RequestedModel string         `json:"requested_model"`
-		ResolvedModel  string         `json:"resolved_model"`
-		Channel        string         `json:"channel"`
-		Reasoning      string         `json:"reasoning_effort,omitempty"`
-		MaxTokens      *int           `json:"max_tokens,omitempty"`
-		Temperature    *float64       `json:"temperature,omitempty"`
-		TopP           *float64       `json:"top_p,omitempty"`
-		ModelMaxTokens int64          `json:"model_max_tokens,omitempty"`
-		Tools          int            `json:"tools"`
-		ToolChoice     string         `json:"tool_choice,omitempty"`
-		Messages       int            `json:"messages"`
-		Roles          map[string]int `json:"roles"`
-		ToolCalls      int            `json:"tool_calls"`
+		RequestedModel     string         `json:"requested_model"`
+		ResolvedModel      string         `json:"resolved_model"`
+		Channel            string         `json:"channel"`
+		Reasoning          string         `json:"reasoning_effort,omitempty"`
+		MaxTokens          *int           `json:"max_tokens,omitempty"`
+		Temperature        *float64       `json:"temperature,omitempty"`
+		TopP               *float64       `json:"top_p,omitempty"`
+		ModelMaxTokens     int64          `json:"model_max_tokens,omitempty"`
+		ModelContextWindow int64          `json:"model_context_window,omitempty"`
+		Tools              int            `json:"tools"`
+		ToolChoice         string         `json:"tool_choice,omitempty"`
+		Messages           int            `json:"messages"`
+		Roles              map[string]int `json:"roles"`
+		ToolCalls          int            `json:"tool_calls"`
 	}{
 		RequestedModel: model, ResolvedModel: upstream.CanonicalModelForAccount(accountID, model),
 		Channel:   upstream.AccountModelChannel(accountID, model),
@@ -54,13 +55,9 @@ func rejectedParamsShape(accountID, model string, messages []upstream.ChatMessag
 		shape.Roles[role]++
 		shape.ToolCalls += len(msg.ToolCalls)
 	}
-	if models, ok := upstream.AccountModels(accountID); ok {
-		for _, info := range models {
-			if info.ID == shape.ResolvedModel {
-				shape.ModelMaxTokens = info.MaxTokens
-				break
-			}
-		}
+	if info, ok := upstream.AccountModelInfo(accountID, model); ok {
+		shape.ModelMaxTokens = info.MaxTokens
+		shape.ModelContextWindow = info.ContextWindow
 	}
 	raw, _ := json.Marshal(shape)
 	return string(raw)

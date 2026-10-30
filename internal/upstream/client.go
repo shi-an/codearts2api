@@ -121,8 +121,9 @@ type Client struct {
 
 	// 分来源失败退避：同一账号的 builtin/福利接口打不通时短期内不再重试，
 	// 避免每次 /v1/models 刷新都空等超时。
-	srcMu   sync.Mutex
-	srcFail map[string]time.Time
+	srcMu      sync.Mutex
+	srcFail    map[string]time.Time
+	modelLoads map[string]*modelCatalogLoad
 }
 
 // srcFailCooldown 上游某一来源连续失败后的退避窗口。

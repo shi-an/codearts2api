@@ -227,6 +227,25 @@ Body：
   探测、渠道签名、跨账号大小写隔离和别名共用可用性缓存。
   本次使用本地模拟服务验证修复，未使用真实账号进行云端推理。
 
+### 2026-10-30：CodeArts Agent 26.10.100 的 DeepSeek 输出预算
+
+从客户端日志的 `AgentCore model-config update` 完整 JSON 按模型键提取，两个条目分别为：
+
+| 推理 ID | `limit.context` | `limit.input` | `limit.output` |
+| --- | --- | --- | --- |
+| `deepseek-v4.1-flash` | 1048576 | 1044480 | 65536 |
+| `deepseek-v4.1-flash-1017` | 1048576 | 1044480 | 65536 |
+
+扩展的 `updateModels` 将当前目录的 `model_parameters.max_tokens` 直接写入
+`limit.output`，`context_window` 写入 `limit.context`。这里是该客户端当时收到的配置，
+不代表模型厂商直连 API 的输出规格，也不保证所有账号、渠道或后续版本一致。
+原始 `models info` 日志可能被截断，不能跨模型搜索后把相邻 GLM 的字段误当 DeepSeek 参数。
+
+服务按当前账号目录限制请求预算；跳过 `/v1/models` 的带预算请求会补查目录，受请求取消和
+10 秒总超时约束。取消或总超时不写入半份目录；已有参数仍可用于预算检查，未知上限保持
+原请求。回归用本地模拟服务覆盖 214057 预算、86 工具和 155 消息的参数调整、账号轮转、
+并发发现与失败退避；未使用真实账号确认该调整是否消除所有云端 400。
+
 ## 8. 脱敏
 
 本仓库不包含任何真实 token。`auths/`、`data/`、`config.json`、`.env` 均 gitignore。

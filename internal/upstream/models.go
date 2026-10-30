@@ -240,6 +240,21 @@ func AccountModels(accountID string) ([]ModelInfo, bool) {
 	return append([]ModelInfo(nil), ac.infos...), true
 }
 
+// AccountModelInfo 只读取实际账号的模型参数；其他账号和静态种子不能提供输出上限。
+func AccountModelInfo(accountID, model string) (ModelInfo, bool) {
+	id := CanonicalModelForAccount(accountID, model)
+	catalog.RLock()
+	defer catalog.RUnlock()
+	if ac := catalog.accounts[accountID]; ac != nil {
+		for _, info := range ac.infos {
+			if info.ID == id {
+				return info, true
+			}
+		}
+	}
+	return ModelInfo{}, false
+}
+
 // AccountCatalogStale 报告某账号目录是否需重新发现（未发现或超过 CatalogTTL）。
 func AccountCatalogStale(accountID string) bool {
 	catalog.RLock()
@@ -380,34 +395,104 @@ func betterModel(a, b ModelInfo) bool {
 	return a.ContextWindow > 0 && b.ContextWindow == 0
 }
 
+type modelCatalogLoad struct {
+	done chan struct{}
+	err  error
+}
+
+// EnsureAccountModels 为跳过 /v1/models 的聊天请求补齐目录。
+// 同一账号合并并发发现；失败退避，避免每次聊天都重复等待上游。
+func (c *Client) EnsureAccountModels(ctx context.Context, acct *auth.Auth) error {
+	if acct == nil {
+		return fmt.Errorf("account required for model fetch")
+	}
+	if !AccountCatalogStale(acct.UserID) {
+		return nil
+	}
+	key := acct.UserID + "|catalog"
+	c.srcMu.Lock()
+	if !AccountCatalogStale(acct.UserID) {
+		c.srcMu.Unlock()
+		return nil
+	}
+	if pending := c.modelLoads[key]; pending != nil {
+		c.srcMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-pending.done:
+			return pending.err
+		}
+	}
+	if until := c.srcFail[key]; time.Now().Before(until) {
+		c.srcMu.Unlock()
+		return fmt.Errorf("model catalog source backoff")
+	}
+	if c.modelLoads == nil {
+		c.modelLoads = map[string]*modelCatalogLoad{}
+	}
+	pending := &modelCatalogLoad{done: make(chan struct{})}
+	c.modelLoads[key] = pending
+	c.srcMu.Unlock()
+
+	_, err := c.FetchModelsContext(ctx, acct)
+	c.srcMu.Lock()
+	pending.err = err
+	if err != nil && ctx.Err() != context.Canceled {
+		if c.srcFail == nil {
+			c.srcFail = map[string]time.Time{}
+		}
+		c.srcFail[key] = time.Now().Add(srcFailCooldown)
+	}
+	delete(c.modelLoads, key)
+	close(pending.done)
+	c.srcMu.Unlock()
+	return err
+}
+
 // FetchModels 拉取指定账号当前可用模型（三路合并），并写入该账号的模型目录。
 //
 // 任一路失败只记日志不阻断：福利接口不可用时仍能拿到内置模型。
 func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
+	return c.FetchModelsContext(context.Background(), acct)
+}
+
+// FetchModelsContext 让首次聊天的目录发现服从请求取消与总超时。
+func (c *Client) FetchModelsContext(ctx context.Context, acct *auth.Auth) ([]ModelInfo, error) {
 	if acct == nil {
 		return nil, fmt.Errorf("account required for model fetch")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	token, ak, sk := acct.Credentials()
 	cred := SignCredential{
-		AccessKeyID:     acct.AccessKeyID,
-		SecretAccessKey: acct.SecretAccessKey,
-		SecurityToken:   acct.CloudDragonTok,
+		AccessKeyID:     ak,
+		SecretAccessKey: sk,
+		SecurityToken:   token,
 	}
 	accountID := acct.UserID
 	var sets [][]ModelInfo
-	if infos, err := c.fetchAgentModels(cred); err != nil {
+	if infos, err := c.fetchAgentModels(ctx, cred); err != nil {
 		Log("agent models: %v", err)
 	} else {
 		sets = append(sets, infos)
 	}
-	if infos, err := c.fetchBuiltinModels(accountID, cred); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if infos, err := c.fetchBuiltinModels(ctx, accountID, cred); err != nil {
 		Log("builtin models: %v", err)
 	} else {
 		sets = append(sets, infos)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	keepChannels := map[string]bool{}
 	gateways := map[string]bool{}
 	for _, channel := range []string{MaasBenefit, MaasEducation} {
-		infos, enabled, err := c.fetchChannelModels(accountID, cred, channel)
+		infos, enabled, err := c.fetchChannelModels(ctx, accountID, cred, channel)
 		if enabled != nil {
 			gateways[channel] = *enabled
 		}
@@ -416,6 +501,9 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 			keepChannels[channel] = true
 		} else {
 			sets = append(sets, infos)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err // 不用被取消的半份目录覆盖已有参数。
 		}
 	}
 	out := MergeModels(sets...)
@@ -431,15 +519,15 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 }
 
 // fetchAgentModels 官方 fetchAgentModels 等价实现：agent-center detail 的 gpts.models。
-func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
-	agentID, err := c.defaultAgentID(cred)
+func (c *Client) fetchAgentModels(ctx context.Context, cred SignCredential) ([]ModelInfo, error) {
+	agentID, err := c.defaultAgentID(ctx, cred)
 	if err != nil {
 		return nil, err
 	}
 	if agentID == "" {
 		return nil, fmt.Errorf("no default agent found")
 	}
-	raw, err := c.getSigned(context.Background(), c.snapURL(EpAgentDetail)+"?agent_id="+url.QueryEscape(agentID), cred, true)
+	raw, err := c.getSigned(ctx, c.snapURL(EpAgentDetail)+"?agent_id="+url.QueryEscape(agentID), cred, true)
 	if err != nil {
 		return nil, err
 	}
@@ -482,8 +570,8 @@ func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
 // defaultAgentID 拉取用户 agent 列表，返回 CodeAgent 的 agent_id。
 // 过滤条件与官方客户端一致：agent_name=="CodeAgent" && alias.alias_zh_cn=="智能体" && show_in_ide，
 // 退化为 is_primary_agent，再退化为首个。
-func (c *Client) defaultAgentID(cred SignCredential) (string, error) {
-	raw, err := c.getSigned(context.Background(), c.snapURL(EpAgentList)+"?offset=0&limit=100&is_primary_agent=true", cred, true)
+func (c *Client) defaultAgentID(ctx context.Context, cred SignCredential) (string, error) {
+	raw, err := c.getSigned(ctx, c.snapURL(EpAgentList)+"?offset=0&limit=100&is_primary_agent=true", cred, true)
 	if err != nil {
 		return "", err
 	}
@@ -518,12 +606,12 @@ func (c *Client) defaultAgentID(cred SignCredential) (string, error) {
 }
 
 // fetchBuiltinModels GET /v1/model/builtin（Agent-Type: PromptCenter）。
-func (c *Client) fetchBuiltinModels(accountID string, cred SignCredential) ([]ModelInfo, error) {
+func (c *Client) fetchBuiltinModels(ctx context.Context, accountID string, cred SignCredential) ([]ModelInfo, error) {
 	key := accountID + "|builtin"
 	if c.srcBlocked(key) {
 		return nil, fmt.Errorf("builtin source backoff")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.snapURL(EpModelBuiltin), nil)
 	if err != nil {
@@ -574,12 +662,12 @@ func (c *Client) fetchBuiltinModels(accountID string, cred SignCredential) ([]Mo
 
 // ClaimBenefit 显式领取默认福利渠道（幂等）。自动领取仅在渠道开关启用时执行。
 func (c *Client) ClaimBenefit(cred SignCredential) error {
-	return c.claimChannelBenefit(cred, MaasBenefit)
+	return c.claimChannelBenefit(context.Background(), cred, MaasBenefit)
 }
 
-func (c *Client) claimChannelBenefit(cred SignCredential, channel string) error {
+func (c *Client) claimChannelBenefit(ctx context.Context, cred SignCredential, channel string) error {
 	body, _ := json.Marshal(map[string]any{})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, channelURL(c.benefitURL(EpBenefitClaim), channel), bytes.NewReader(body))
 	if err != nil {
@@ -615,17 +703,17 @@ func (c *Client) claimChannelBenefit(cred SignCredential, channel string) error 
 }
 
 // fetchGatewayModels 拉取已启用渠道的模型；开关检查由 fetchChannelModels 完成。
-func (c *Client) fetchGatewayModels(accountID string, cred SignCredential, channel string) ([]ModelInfo, error) {
+func (c *Client) fetchGatewayModels(ctx context.Context, accountID string, cred SignCredential, channel string) ([]ModelInfo, error) {
 	key := accountID + "|" + channel
 	if c.srcBlocked(key) {
 		return nil, fmt.Errorf("%s source backoff", channel)
 	}
 	if c.claimAuto.Load() {
-		if err := c.claimChannelBenefit(cred, channel); err != nil {
+		if err := c.claimChannelBenefit(ctx, cred, channel); err != nil {
 			Log("%s claim: %v", channel, err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, channelURL(c.benefitURL(EpBenefitConfig), channel), nil)
 	if err != nil {

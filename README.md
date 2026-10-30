@@ -87,6 +87,22 @@ sub2api 的映射目标须填写实际模型 ID，例如 `deepseek-v4.1-flash-10
 `resolved_model`、`reasoning_effort`、`max_tokens` 与已发现的 `model_max_tokens`。
 排队日志也会保留上游错误摘要，用于区分 TPM 限流和并发会话限制。
 
+### 输出预算与参数 400
+
+输出预算遵循**当前账号的 CodeArts 模型目录**中 `max_tokens`，已知上限也会通过
+`/v1/models` 的 `max_output_tokens` 返回。带输出预算的聊天请求遇到目录缺失或过期时，
+只为所选账号补查一次，最多等待 10 秒；并发聊天合并发现，失败后退避 5 分钟。
+
+`max_tokens` / `max_completion_tokens` 超过已知上限时会自动收窄，并记录
+`max_tokens capped ... requested_max_tokens=... effective_max_tokens=...`。换账号时重新
+按原始预算计算；未传预算或渠道未提供上限时保持原样，不推测固定上限。
+
+2026-10-30 的官方 Agent 26.10.100 模型配置中，`deepseek-v4.1-flash` 与
+`deepseek-v4.1-flash-1017` 均为 1M 上下文、65536 输出预算。DeepSeek 直连 API 的
+384K 输出规格不能代替这份渠道配置；服务读取账号的实时目录，不硬编码这两个型号。
+参数 400 的诊断同时记录已知 `model_max_tokens` 与 `model_context_window`。若预算已符合
+上限仍被拒绝，仍需核对工具定义和消息格式，不能只凭工具或消息数量断定原因。
+
 ### 模型列表与客户端权益渠道
 
 `/v1/models` 返回上游**精确推理 ID**（区分大小写，如 `GLM-5.2`、`glm-5.3`），

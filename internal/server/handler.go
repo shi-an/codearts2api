@@ -27,7 +27,7 @@ import (
 // Config handler 依赖。
 type Config struct {
 	Pool         *pool.Pool
-	Upstream     *upstream.Client
+	Upstream     ModelCatalogClient
 	APIKey       string
 	MaxRotate    int
 	SoftCooldown time.Duration
@@ -818,6 +818,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Pool.NeedKeepalive(acct.Name) {
 			h.cfg.Pool.PingKeepalive(acct.Name)
 		}
+		maxTokens := h.outputTokensForAccount(r.Context(), acct, model, req.MaxTokens)
+		if r.Context().Err() != nil {
+			h.cfg.Pool.ReleaseLock(acct.Name)
+			return
+		}
 
 		chatID := req.ConversationID
 		// 上游要求 chat_id 为 32 位十六进制（UUID 去连字符）；无显式 id 时每次新建。
@@ -833,7 +838,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		chatOpts := upstream.ChatOptions{
 			ReasoningEffort: req.ReasoningEffort,
-			MaxTokens:       req.MaxTokens,
+			MaxTokens:       maxTokens,
 			Temperature:     req.Temperature,
 			TopP:            req.TopP,
 			Tools:           tools,
