@@ -278,12 +278,45 @@ Body：
 
 本地模拟回归覆盖四路解析、同渠道字段补齐、字段优先级、跨渠道隔离、部分失败与关闭、
 高于 64K 的预算透传、实际请求渠道签名和诊断脱敏。393216 等测试数值为合成样本，
-尚未确认用户账号的 DeepSeek 目录是否提供更大的 `output_context_window`；
-代理侧未直接进行真实云端推理。
+当时尚未拿到 DeepSeek 的完整原始字段；后续实际缓存核对见下节。代理侧未直接进行真实云端推理。
 
 随后用户部署复测确认：更新代理后，自动收窄到 64K 的请求已正常返回；成功路径使用了
 代理的预算调整。该反馈验证了修正的实际效果，但尚无新的实时目录或完整请求日志，
 也未测试大于 64K 时的精确接受阈值，不能据此认定所有账号或渠道都固定限制为 64K。
+
+### 2026-10-30：完整原始目录缓存核对
+
+官方 IDE 启动刷新后，运行时配置仍为 1M 上下文、65536 输出预算。由于 `models info`
+日志在约 5KB 处截断，继续以 SQLite 只读查询精确的扩展模型缓存键
+`huaweicloud.codearts-snap` → `hc-task-info-key` → `modelInfo`，只提取预算、能力和
+排队字段；同时核对 `hc.current.modelInfo` 的模型 ID 与渠道。脱敏字段快照见
+[DeepSeek 配置样本](codearts-agent-deepseek-config-2026-10-30.json)。
+
+两个条目 `deepseek-v4.1-flash`、`deepseek-v4.1-flash-1017` 的下列配置一致：
+
+| 原始字段 | 值 | 本次可确认的含义 |
+| --- | --- | --- |
+| `context_window` | 1048576 | 目录声明的上下文预算 |
+| `input_length` / `truncate_length` | 1044480 | 目录声明的输入及截断预算 |
+| `max_tokens` | 65536 | 当前输出预算的来源 |
+| `output_context_window` | 0 | 没有提供另一份正数输出预算；桌面端也会回退到 `max_tokens` |
+| `model_type`（顶层） | `admin` | 目录中的模型分类标记 |
+| `channel_source` / `provider` | `codearts` / `internal` | 目录来源标记，不代替请求的 `maas_type` |
+| `supported_clients` | `["all"]` | 该目录未把模型限定为某一客户端 |
+| `thinking_type` / `supported_thinking_strengths` | `null` / `[]` | 此记录没有声明推理档位，不能外推为模型厂商能力 |
+| `supports_images` / `supports_computer_use` | `false` / `false` | 此目录未声明图片或电脑操作能力 |
+| `is_tool_call_priority` | `true` | 工具调用优先标记，不是工具数量上限 |
+| `enable_queue` | `true` | 该目录启用了上游排队 |
+| `working_queue_length` / `waiting_queue_length` | 500 / 5000 | 排队配置值，不能当作单账号并发额度 |
+| `working_queue_timeout_s` | 600 | 上游目录中的排队超时字段，不要求代理等待相同时长 |
+
+本机当时选中 `deepseek-v4.1-flash`，未指定 `maas_type`；两个缓存条目也未标记
+`maas_type` 或 `is_free_benefit`。同次启动日志在 16:12:37（UTC+8）记录福利、教育
+开关的 HTTP 200 响应均为 `enabled=false`，教育另有 `is_student_certified=false`。
+这些是本机该次目录与渠道状态，不能外推到池中其他账号或后续刷新。
+
+本次没有发现修改客户端或切换权益头便可使用 384K 输出的配置依据。已有自动收窄
+逻辑与实际目录吻合，保持按账号、渠道读取预算；未修改推理代码或进行更高输出预算测试。
 
 ## 8. 脱敏
 
