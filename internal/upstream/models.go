@@ -5,8 +5,8 @@
 //  2. 内置：GET /v1/model/builtin（Agent-Type: PromptCenter）
 //  3. 限时福利（免费套餐）：GET {opengw}/api/v1/gateway/config
 //
-// 福利模型不在 agent-center 注册，聊天必须追加请求头 maas_type: benefit，
-// 否则上游返回 InferHub.002002009.404 model is not registered。
+// 权益渠道的记录需追加 maas_type: benefit / education；同 ID 的普通记录独立保存。
+// 渠道与参数不能交叉合并，否则可能误路由或误用另一渠道的输出预算。
 //
 // 目录按账号隔离：福利是按账号授予的，池里 A 账号有、B 账号没有时不允许互相污染，
 // 因此 IsBenefitModel 必须带账号身份查询（见 SetAccountModels）。
@@ -41,14 +41,37 @@ const (
 // ModelInfo 模型信息（与 workbuddy/trae 一致）。
 type ModelInfo struct {
 	// ID 是上游推理 ID，Name 是展示名，两者不能互换。
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	ContextWindow int64  `json:"contextWindow,omitempty"`
-	MaxTokens     int64  `json:"maxTokens,omitempty"`
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	ContextWindow       int64  `json:"contextWindow,omitempty"`
+	MaxTokens           int64  `json:"maxTokens,omitempty"`
+	OutputContextWindow int64  `json:"outputContextWindow,omitempty"`
 	// Benefit 兼容旧版字段；教育渠道也属于客户端的权益模型。
 	Benefit  bool   `json:"benefit,omitempty"`
 	MaasType string `json:"maas_type,omitempty"`
 	Desc     string `json:"desc,omitempty"`
+}
+
+// OutputLimit 按桌面客户端顺序读取目录声明的输出预算，不推测服务端硬限制。
+func (mi ModelInfo) OutputLimit() int64 {
+	if mi.OutputContextWindow > 0 {
+		return mi.OutputContextWindow
+	}
+	if mi.MaxTokens > 0 {
+		return mi.MaxTokens
+	}
+	return 0
+}
+
+// OutputLimitSource 保留预算来源，便于区分 IDE 与桌面端读取的字段。
+func (mi ModelInfo) OutputLimitSource() string {
+	if mi.OutputContextWindow > 0 {
+		return "output_context_window"
+	}
+	if mi.MaxTokens > 0 {
+		return "max_tokens"
+	}
+	return ""
 }
 
 // ModelChannel 返回模型的权益渠道；旧版 Benefit=true 等价于 benefit。
@@ -85,16 +108,21 @@ var seedBenefit = func() map[string]bool {
 
 // accountCatalog 一个账号的模型目录快照。
 type accountCatalog struct {
-	infos    []ModelInfo
-	channels map[string]string // lower(id) -> maas_type
-	gateways map[string]bool   // 仅记录成功读取的渠道开关；失败不能当作关闭
-	knows    map[string]bool   // lower(id) -> true（该账号目录里登记过的全部模型）
-	exactIDs map[string]string // lower(id/name) -> 该账号的精确推理 ID
-	// lastBenefit 上一次福利来源成功时的福利条目。福利网关临时故障时用它兜底：
-	// 只在内置来源明确说「它不是福利」时才摘标记，否则保留，避免把
-	// maas_type: benefit 头弄丢（丢了就是 InferHub.002002009.404）。
-	lastBenefit map[string]ModelInfo
-	fetched     time.Time
+	infos    []ModelInfo          // 保留同 ID 的各渠道记录
+	models   map[string]ModelInfo // lower(id) -> 默认记录，路由与预算一起选择
+	gateways map[string]bool      // 仅记录成功读取的渠道开关；失败不能当作关闭
+	exactIDs map[string]string    // lower(id/name) -> 默认记录的精确推理 ID
+	// 上次确认的权益记录按 ID + 渠道保存，单个渠道失败不能覆盖另一渠道。
+	lastChannels map[modelCatalogKey]ModelInfo
+	fetched      time.Time
+}
+
+type modelCatalogKey struct {
+	id, channel string
+}
+
+func catalogKey(mi ModelInfo) modelCatalogKey {
+	return modelCatalogKey{strings.ToLower(mi.ID), ModelChannel(mi)}
 }
 
 var catalog = struct {
@@ -136,13 +164,11 @@ func setAccountChannelModels(accountID string, infos []ModelInfo, keepChannels, 
 		return
 	}
 	ac := &accountCatalog{
-		infos:       append([]ModelInfo(nil), infos...),
-		channels:    make(map[string]string),
-		gateways:    make(map[string]bool),
-		knows:       make(map[string]bool),
-		exactIDs:    make(map[string]string),
-		lastBenefit: map[string]ModelInfo{},
-		fetched:     time.Now(),
+		models:       make(map[string]ModelInfo),
+		gateways:     make(map[string]bool),
+		exactIDs:     make(map[string]string),
+		lastChannels: map[modelCatalogKey]ModelInfo{},
+		fetched:      time.Now(),
 	}
 	catalog.Lock()
 	defer catalog.Unlock()
@@ -153,56 +179,39 @@ func setAccountChannelModels(accountID string, infos []ModelInfo, keepChannels, 
 		for channel, enabled := range prev.gateways {
 			ac.gateways[channel] = enabled
 		}
-		for k, v := range prev.lastBenefit {
-			if keepChannels[ModelChannel(v)] {
-				ac.lastBenefit[k] = v
-			}
-		}
 	}
 	for channel, enabled := range gateways {
 		ac.gateways[channel] = enabled
 	}
-	for _, mi := range ac.infos {
-		if mi.ID == "" {
-			continue
-		}
-		key := strings.ToLower(mi.ID)
-		ac.knows[key] = true
-		if channel := ModelChannel(mi); channel != "" {
-			ac.channels[key] = channel
-			ac.lastBenefit[key] = mi
+	var retained []ModelInfo
+	if prev := catalog.accounts[accountID]; prev != nil {
+		for key, mi := range prev.lastChannels {
+			if keepChannels[key.channel] {
+				if enabled, known := ac.gateways[key.channel]; !known || enabled {
+					retained = append(retained, mi)
+				}
+			}
 		}
 	}
-	if len(ac.lastBenefit) > 0 {
-		// 本轮内置来源没有提到的福利模型：继续按福利路由（宁可多带，不可漏带）。
-		for key, mi := range ac.lastBenefit {
-			if ac.knows[key] {
-				if ac.channels[key] == "" {
-					delete(ac.lastBenefit, key)
-				}
-				continue // 内置来源明确登记了它 → 已转正，不保留标记
-			}
-			ac.channels[key] = ModelChannel(mi)
-			ac.knows[key] = true
-			ac.infos = append(ac.infos, mi)
+	ac.infos = MergeModels(infos, retained)
+	for _, mi := range ac.infos {
+		if ModelChannel(mi) != "" {
+			ac.lastChannels[catalogKey(mi)] = mi
 		}
-		sort.Slice(ac.infos, func(i, j int) bool {
-			li, lj := strings.ToLower(ac.infos[i].ID), strings.ToLower(ac.infos[j].ID)
-			if li != lj {
-				return li < lj
-			}
-			return ac.infos[i].ID < ac.infos[j].ID
-		})
+	}
+	defaults := DefaultModels(ac.infos)
+	for _, mi := range defaults {
+		ac.models[strings.ToLower(mi.ID)] = mi
 	}
 	// 展示名可作为兼容别名，但不能覆盖同一目录中已存在的真实 ID。
-	for _, mi := range ac.infos {
+	for _, mi := range defaults {
 		key := strings.ToLower(strings.TrimSpace(mi.Name))
-		if mi.ID != "" && key != "" && !ac.knows[key] {
+		if _, actualID := ac.models[key]; key != "" && !actualID {
 			ac.exactIDs[key] = mi.ID
 			catalog.known[key] = mi.ID
 		}
 	}
-	for _, mi := range ac.infos {
+	for _, mi := range defaults {
 		if mi.ID != "" {
 			key := strings.ToLower(mi.ID)
 			ac.exactIDs[key] = mi.ID
@@ -246,11 +255,8 @@ func AccountModelInfo(accountID, model string) (ModelInfo, bool) {
 	catalog.RLock()
 	defer catalog.RUnlock()
 	if ac := catalog.accounts[accountID]; ac != nil {
-		for _, info := range ac.infos {
-			if info.ID == id {
-				return info, true
-			}
-		}
+		info, ok := ac.models[strings.ToLower(id)]
+		return info, ok
 	}
 	return ModelInfo{}, false
 }
@@ -284,11 +290,8 @@ func AccountModelChannel(accountID, model string) string {
 	catalog.RLock()
 	defer catalog.RUnlock()
 	if ac, ok := catalog.accounts[accountID]; ok {
-		if channel := ac.channels[key]; channel != "" {
-			return channel
-		}
-		if ac.knows[key] {
-			return ""
+		if info, known := ac.models[key]; known {
+			return ModelChannel(info)
 		}
 		if enabled, known := ac.gateways[MaasBenefit]; known && !enabled {
 			return ""
@@ -307,7 +310,10 @@ func AccountModelGatewayDisabled(accountID, model string) bool {
 	catalog.RLock()
 	defer catalog.RUnlock()
 	ac := catalog.accounts[accountID]
-	if ac == nil || ac.knows[key] || !seedBenefit[key] {
+	if ac == nil || !seedBenefit[key] {
+		return false
+	}
+	if _, known := ac.models[key]; known {
 		return false
 	}
 	enabled, known := ac.gateways[MaasBenefit]
@@ -326,17 +332,18 @@ func lookupKnownModel(id string) (string, bool) {
 	return exact, ok
 }
 
-// MergeModels 合并多路模型列表：按小写 ID 去重，福利标记取或，参数更全的优先。
-// 精确 ID 沿用首个来源；调用方按 agent-center、内置、权益来源的优先级传入。
-// 结果按小写 ID 排序，保证 /v1/models 输出稳定（缓存刷新前后顺序一致）。
+// MergeModels 只在小写 ID 和渠道都相同时合并参数，保留各渠道独立记录。
+// 精确 ID 沿用该渠道的首个来源；结果按 ID、默认渠道顺序稳定排序。
 func MergeModels(sets ...[]ModelInfo) []ModelInfo {
-	merged := map[string]ModelInfo{}
+	merged := map[modelCatalogKey]ModelInfo{}
 	for _, set := range sets {
 		for _, mi := range set {
 			if mi.ID == "" {
 				continue
 			}
-			key := strings.ToLower(mi.ID)
+			key := catalogKey(mi)
+			mi.MaasType = key.channel
+			mi.Benefit = key.channel != ""
 			cur, ok := merged[key]
 			if !ok {
 				merged[key] = mi
@@ -354,35 +361,67 @@ func MergeModels(sets ...[]ModelInfo) []ModelInfo {
 		if li != lj {
 			return li < lj
 		}
+		ci, cj := ModelChannel(out[i]), ModelChannel(out[j])
+		if pi, pj := channelPriority(ci), channelPriority(cj); pi != pj {
+			return pi < pj
+		}
+		if ci != cj {
+			return ci < cj
+		}
 		return out[i].ID < out[j].ID
 	})
 	return out
 }
 
-// richerModel 合并同一模型的两条记录：福利标记取或（漏标即漏头），其余取更全的一条。
-func richerModel(cur, next ModelInfo) ModelInfo {
-	channel := ModelChannel(cur)
-	if nextChannel := ModelChannel(next); channel == "" || nextChannel == MaasBenefit {
-		channel = nextChannel
+// DefaultModels 为只提供模型 ID 的请求选择整条记录：普通渠道优先，
+// 没有普通渠道时沿用 benefit、education 顺序；不跨渠道借用参数。
+func DefaultModels(infos []ModelInfo) []ModelInfo {
+	var out []ModelInfo
+	seen := map[string]bool{}
+	for _, mi := range MergeModels(infos) {
+		key := strings.ToLower(mi.ID)
+		if !seen[key] {
+			out = append(out, mi)
+			seen[key] = true
+		}
 	}
+	return out
+}
+
+func channelPriority(channel string) int {
+	switch channel {
+	case "":
+		return 0
+	case MaasBenefit:
+		return 1
+	case MaasEducation:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// richerModel 仅合并同 ID、同渠道的记录，沿用优先来源的推理身份。
+func richerModel(cur, next ModelInfo) ModelInfo {
 	keep, drop := cur, next
 	if betterModel(next, cur) {
 		keep, drop = next, cur
 	}
 	// 参数更全不代表 ID 大小写更准确，不能覆盖高优先级来源的推理 ID。
 	keep.ID = cur.ID
-	keep.Benefit = channel != ""
-	keep.MaasType = channel
 	if cur.Name != "" && cur.Name != cur.ID {
 		keep.Name = cur.Name
 	} else if keep.Name == "" {
 		keep.Name = drop.Name
 	}
-	if keep.ContextWindow == 0 {
+	if keep.ContextWindow <= 0 {
 		keep.ContextWindow = drop.ContextWindow
 	}
-	if keep.MaxTokens == 0 {
+	if keep.MaxTokens <= 0 {
 		keep.MaxTokens = drop.MaxTokens
+	}
+	if keep.OutputContextWindow <= 0 {
+		keep.OutputContextWindow = drop.OutputContextWindow
 	}
 	if keep.Desc == "" {
 		keep.Desc = drop.Desc
@@ -538,10 +577,14 @@ func (c *Client) fetchAgentModels(ctx context.Context, cred SignCredential) ([]M
 				ModelName  string `json:"model_name"`
 				ModelID    string `json:"model_id"`
 				Params     struct {
-					ContextWindow int64  `json:"context_window"`
-					MaxTokens     int64  `json:"max_tokens"`
-					ModelID       string `json:"model_id"`
-					ModelDesc     string `json:"model_desc"`
+					ContextWindow       int64  `json:"context_window"`
+					InputContextWindow  int64  `json:"input_context_window"`
+					OutputContextWindow int64  `json:"output_context_window"`
+					MaxTokens           int64  `json:"max_tokens"`
+					ModelID             string `json:"model_id"`
+					ModelDesc           string `json:"model_desc"`
+					IsFreeBenefit       bool   `json:"is_free_benefit"`
+					MaasType            string `json:"maas_type"`
 				} `json:"model_parameters"`
 			} `json:"models"`
 		} `json:"gpts"`
@@ -557,11 +600,14 @@ func (c *Client) fetchAgentModels(ctx context.Context, cred SignCredential) ([]M
 			continue
 		}
 		out = append(out, ModelInfo{
-			ID:            id,
-			Name:          firstNonEmpty(m.ModelName, id),
-			ContextWindow: m.Params.ContextWindow,
-			MaxTokens:     m.Params.MaxTokens,
-			Desc:          m.Params.ModelDesc,
+			ID:                  id,
+			Name:                firstNonEmpty(m.ModelName, id),
+			ContextWindow:       firstPositive(m.Params.ContextWindow, m.Params.InputContextWindow),
+			MaxTokens:           m.Params.MaxTokens,
+			OutputContextWindow: m.Params.OutputContextWindow,
+			Desc:                m.Params.ModelDesc,
+			Benefit:             m.Params.IsFreeBenefit,
+			MaasType:            m.Params.MaasType,
 		})
 	}
 	return out, nil
@@ -637,11 +683,15 @@ func (c *Client) fetchBuiltinModels(ctx context.Context, accountID string, cred 
 	}
 	var out struct {
 		BuiltinModels []struct {
-			ModelID       string `json:"model_id"`
-			ModelName     string `json:"model_name"`
-			ModelDesc     string `json:"model_desc"`
-			ContextWindow int64  `json:"context_window"`
-			MaxTokens     int64  `json:"max_tokens"`
+			ModelID             string `json:"model_id"`
+			ModelName           string `json:"model_name"`
+			ModelDesc           string `json:"model_desc"`
+			ContextWindow       int64  `json:"context_window"`
+			InputContextWindow  int64  `json:"input_context_window"`
+			OutputContextWindow int64  `json:"output_context_window"`
+			MaxTokens           int64  `json:"max_tokens"`
+			IsFreeBenefit       bool   `json:"is_free_benefit"`
+			MaasType            string `json:"maas_type"`
 		} `json:"builtinModels"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -655,7 +705,12 @@ func (c *Client) fetchBuiltinModels(ctx context.Context, accountID string, cred 
 		if id == "" {
 			continue
 		}
-		infos = append(infos, ModelInfo{ID: id, Name: firstNonEmpty(m.ModelName, id), ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Desc: m.ModelDesc})
+		infos = append(infos, ModelInfo{
+			ID: id, Name: firstNonEmpty(m.ModelName, id),
+			ContextWindow: firstPositive(m.ContextWindow, m.InputContextWindow),
+			MaxTokens:     m.MaxTokens, OutputContextWindow: m.OutputContextWindow, Desc: m.ModelDesc,
+			Benefit: m.IsFreeBenefit, MaasType: m.MaasType,
+		})
 	}
 	return infos, nil
 }
@@ -741,14 +796,16 @@ func (c *Client) fetchGatewayModels(ctx context.Context, accountID string, cred 
 		Result    struct {
 			BaseURL string `json:"base_url"`
 			Models  []struct {
-				ModelID        string `json:"model_id"`
-				ModelIDCamel   string `json:"modelId"`
-				ModelName      string `json:"model_name"`
-				ModelNameCamel string `json:"modelName"`
-				ModelDesc      string `json:"model_desc"`
-				Description    string `json:"description"`
-				ContextWindow  int64  `json:"context_window"`
-				MaxTokens      int64  `json:"max_tokens"`
+				ModelID             string `json:"model_id"`
+				ModelIDCamel        string `json:"modelId"`
+				ModelName           string `json:"model_name"`
+				ModelNameCamel      string `json:"modelName"`
+				ModelDesc           string `json:"model_desc"`
+				Description         string `json:"description"`
+				ContextWindow       int64  `json:"context_window"`
+				InputContextWindow  int64  `json:"input_context_window"`
+				OutputContextWindow int64  `json:"output_context_window"`
+				MaxTokens           int64  `json:"max_tokens"`
 			} `json:"models"`
 		} `json:"result"`
 	}
@@ -773,9 +830,19 @@ func (c *Client) fetchGatewayModels(ctx context.Context, accountID string, cred 
 		}
 		infos = append(infos, ModelInfo{
 			ID: id, Name: firstNonEmpty(m.ModelName, m.ModelNameCamel, id),
-			ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Desc: firstNonEmpty(m.ModelDesc, m.Description),
+			ContextWindow: firstPositive(m.ContextWindow, m.InputContextWindow),
+			MaxTokens:     m.MaxTokens, OutputContextWindow: m.OutputContextWindow, Desc: firstNonEmpty(m.ModelDesc, m.Description),
 			Benefit: true, MaasType: channel,
 		})
 	}
 	return infos, nil
+}
+
+func firstPositive(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }

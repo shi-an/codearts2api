@@ -506,8 +506,8 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 			add(lower, ctx, maxOut, channel)
 		}
 	}
-	for _, mi := range infos {
-		addAlias(mi.ID, mi.ContextWindow, mi.MaxTokens, upstream.ModelChannel(mi))
+	for _, mi := range upstream.DefaultModels(infos) {
+		addAlias(mi.ID, mi.ContextWindow, mi.OutputLimit(), upstream.ModelChannel(mi))
 	}
 	for _, sm := range staticModels {
 		channel := ""

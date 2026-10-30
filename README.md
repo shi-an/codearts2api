@@ -84,24 +84,29 @@ sub2api 的映射目标须填写实际模型 ID，例如 `deepseek-v4.1-flash-10
 
 参数 400 会记录一行 `upstream params rejected ... request_shape={...}`，仅含模型、
 渠道、生成参数和消息/工具数量，不含正文、工具定义或凭据。可用它核对 `requested_model`、
-`resolved_model`、`reasoning_effort`、`max_tokens` 与已发现的 `model_max_tokens`。
+`resolved_model`、`reasoning_effort`、`max_tokens` 与已发现的 `model_output_limit` 及其来源。
 排队日志也会保留上游错误摘要，用于区分 TPM 限流和并发会话限制。
 
 ### 输出预算与参数 400
 
-输出预算遵循**当前账号的 CodeArts 模型目录**中 `max_tokens`，已知上限也会通过
+输出预算遵循**当前账号所选渠道的 CodeArts 模型目录**。与桌面客户端 0.2.6 一致，
+优先使用正数 `output_context_window`，缺失时回退到 `max_tokens`；已知预算也会通过
 `/v1/models` 的 `max_output_tokens` 返回。带输出预算的聊天请求遇到目录缺失或过期时，
 只为所选账号补查一次，最多等待 10 秒；并发聊天合并发现，失败后退避 5 分钟。
 
-`max_tokens` / `max_completion_tokens` 超过已知上限时会自动收窄，并记录
-`max_tokens capped ... requested_max_tokens=... effective_max_tokens=...`。换账号时重新
-按原始预算计算；未传预算或渠道未提供上限时保持原样，不推测固定上限。
+`max_tokens` / `max_completion_tokens` 超过目录声明的预算时会自动收窄，并记录
+`max_tokens capped ... channel=... limit_source=... requested_max_tokens=... effective_max_tokens=...`。
+换账号时重新按原始预算计算；未传预算或渠道未提供预算时保持原样，不推测固定上限。
 
-2026-10-30 的官方 Agent 26.10.100 模型配置中，`deepseek-v4.1-flash` 与
-`deepseek-v4.1-flash-1017` 均为 1M 上下文、65536 输出预算。DeepSeek 直连 API 的
-384K 输出规格不能代替这份渠道配置；服务读取账号的实时目录，不硬编码这两个型号。
-参数 400 的诊断同时记录已知 `model_max_tokens` 与 `model_context_window`。若预算已符合
-上限仍被拒绝，仍需核对工具定义和消息格式，不能只凭工具或消息数量断定原因。
+2026-10-30 本地 Agent IDE 26.10.100 日志中，`deepseek-v4.1-flash` 与
+`deepseek-v4.1-flash-1017` 的配置均为 1M 上下文、65536 输出预算。IDE 直接读取
+`max_tokens`，桌面端则优先读取 `output_context_window`，因此两者可能显示不同预算。
+这份 IDE 日志**不能证明服务端固定限制为 64K，也没有确认它就是参数 400 的根因**；
+同样，DeepSeek 直连 API 的 384K 规格不能证明当前 CodeArts 账号或渠道支持该数值。
+
+参数 400 的诊断同时记录原始 `model_max_tokens`、`model_output_context_window`、
+实际采用的 `model_output_limit` / `model_output_limit_source` 及 `model_context_window`。
+若仍被拒绝，需结合这些字段继续核对工具定义和消息格式；工具或消息数量本身不足以定因。
 
 ### 模型列表与客户端权益渠道
 
@@ -114,6 +119,16 @@ sub2api 的映射目标须填写实际模型 ID，例如 `deepseek-v4.1-flash-10
 福利和教育渠道模型额外带 `benefit: true` 及 `maas_type: benefit / education` 标记。
 列表是各账号模型的并集；聊天与探测均按实际使用账号的目录解析渠道，在签名前追加
 上游要求的 `maas_type` 请求头。
+
+同 ID 的普通、福利和教育记录独立保存，预算不跨渠道拼接。只提供模型 ID 时，
+与官方 IDE 的普通目录优先规则一致：先选普通记录；没有普通记录时，沿用
+`benefit → education` 的兼容顺序，路由与预算一起选择。`/v1/models` 每个 ID 展示
+默认记录，探测每个默认记录一次；可用性缓存按账号、模型和渠道隔离。
+`cmd/models -json -claim=false` 可查看所有渠道的原始参数。
+
+CodeArts 网页端使用 `/chat/.../cloudagent/sessions/.../messages` 的会话协议；
+Agent IDE 与桌面客户端使用 `/api/v2/chat/completions`。本项目沿用客户端协议。
+网页会话成功不能直接证明兼容 API 的某组生成参数有效；当前尚未确认网页端的输出预算。
 
 福利模型列表随免费套餐轮换，用下面这条命令核对当前账号实际可用的模型：
 

@@ -64,7 +64,7 @@ var probesStop = make(chan struct{})
 
 var availability = struct {
 	sync.Mutex
-	byKey     map[string]availEntry // accountID|modelLower -> 状态
+	byKey     map[string]availEntry // accountID|modelLower|channel -> 状态
 	probing   map[string]bool       // 正在探测的 key（去重）
 	sweeping  bool                  // 是否已有一轮后台批量探测在跑
 	lastSweep time.Time
@@ -75,7 +75,7 @@ var availability = struct {
 }{byKey: map[string]availEntry{}, probing: map[string]bool{}, lastTraffic: map[string]time.Time{}}
 
 func availKey(accountID, model string) string {
-	return accountID + "|" + strings.ToLower(upstream.CanonicalModelForAccount(accountID, model))
+	return accountID + "|" + strings.ToLower(upstream.CanonicalModelForAccount(accountID, model)) + "|" + upstream.AccountModelChannel(accountID, model)
 }
 
 // modelAvailability 返回缓存的可用性；过期视为未知。
@@ -299,7 +299,7 @@ func (h *Handler) pendingProbes() []pendingProbe {
 		if !ok {
 			continue
 		}
-		for _, mi := range models {
+		for _, mi := range upstream.DefaultModels(models) {
 			if st, _ := modelAvailability(acct.UID, mi.ID); st != availUnknown {
 				continue
 			}

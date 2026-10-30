@@ -133,3 +133,47 @@ func keysOf[T any](m map[string]T) []string {
 	}
 	return out
 }
+
+func TestModelListAndProbesSelectOneWholeChannelRecord(t *testing.T) {
+	models := []upstream.ModelInfo{
+		{ID: "Shared-Catalog-Model", Benefit: true, ContextWindow: 32768, MaxTokens: 8192},
+		{ID: "shared-catalog-model", ContextWindow: 1048576, MaxTokens: 65536, OutputContextWindow: 393216},
+		{ID: "shared-catalog-model", MaasType: upstream.MaasEducation, OutputContextWindow: 16384},
+	}
+	count := 0
+	for _, entry := range modelEntries(models) {
+		if entry["id"] == "shared-catalog-model" {
+			count++
+			if entry["max_output_tokens"] != int64(393216) || entry["context_length"] != int64(1048576) || entry["maas_type"] != nil || entry["benefit"] != nil {
+				t.Errorf("model list mixed channel metadata: %+v", entry)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("model ID listed %d times", count)
+	}
+	h, p := queueTestHandler(t, "http://unused.invalid")
+	upstream.SetAccountModels(p.Accounts()[0].UID, models)
+	probes := h.pendingProbes()
+	if len(probes) != 1 || probes[0].model != "shared-catalog-model" {
+		t.Fatalf("same default route scheduled multiple probes: %+v", probes)
+	}
+}
+
+func TestModelAvailabilityDoesNotCrossChannels(t *testing.T) {
+	const model = "availability-channel-model"
+	acct := t.Name()
+	upstream.SetAccountModels(acct, []upstream.ModelInfo{{ID: model, Benefit: true}})
+	markUnusable(acct, model, "synthetic trial failure")
+	for _, channel := range []string{"", upstream.MaasEducation} {
+		upstream.SetAccountModels(acct, []upstream.ModelInfo{{ID: model, MaasType: channel}})
+		if state, _ := modelAvailability(acct, model); state != availUnknown {
+			t.Errorf("benefit failure leaked into channel %q: %v", channel, state)
+		}
+		markUsable(acct, model)
+	}
+	upstream.SetAccountModels(acct, []upstream.ModelInfo{{ID: model, Benefit: true}})
+	if state, _ := modelAvailability(acct, model); state != availUnusable {
+		t.Error("other channels overwrote the original channel result")
+	}
+}

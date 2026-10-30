@@ -65,8 +65,8 @@ func main() {
 			if channel := upstream.ModelChannel(m); channel != "" {
 				tag = channel
 			}
-			fmt.Printf("  [%-7s] %-28s ctx=%-8d max=%-8d %s\n",
-				tag, m.ID, m.ContextWindow, m.MaxTokens, m.Desc)
+			fmt.Printf("  [%-9s] %-28s ctx=%-8d output=%-8d source=%-21s %s\n",
+				tag, m.ID, m.ContextWindow, m.OutputLimit(), m.OutputLimitSource(), m.Desc)
 		}
 	}
 	if !*claim && !*jsonOut {

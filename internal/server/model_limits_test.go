@@ -48,7 +48,7 @@ func TestChatCompletionsCapsDiscoveredOutputWithoutDroppingToolsOrHistory(t *tes
 					t.Error(err)
 					return
 				}
-				// 隔离的模拟上游：重现渠道预算超限时返回的参数错误。
+				// 隔离的模拟上游：只验证目录预算策略，不代表真实服务端阈值。
 				if body.MaxTokens > 65536 {
 					w.WriteHeader(http.StatusBadRequest)
 					io.WriteString(w, "InferHub.001001005.400 The request param is invalid")
@@ -187,6 +187,78 @@ func TestOutputLimitDoesNotInventOrIncreaseBudget(t *testing.T) {
 			got := h.outputTokensForAccount(context.Background(), acct, "output-limit-model", requested)
 			if got != requested {
 				t.Fatalf("changed valid/unknown/omitted budget: got=%v, want=%v", got, requested)
+			}
+		})
+	}
+}
+
+func TestChatUsesSelectedChannelOutputBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		models  []upstream.ModelInfo
+		channel string
+		wantMax int
+	}{
+		{
+			name: "desktop_larger_than_ide",
+			models: []upstream.ModelInfo{
+				{ID: "channel-budget-model", Benefit: true, OutputContextWindow: 8192},
+				{ID: "channel-budget-model", MaxTokens: 65536, OutputContextWindow: 393216},
+			},
+			wantMax: 214057,
+		},
+		{
+			name: "benefit_and_education",
+			models: []upstream.ModelInfo{
+				{ID: "channel-budget-model", MaasType: upstream.MaasEducation, OutputContextWindow: 32768},
+				{ID: "channel-budget-model", Benefit: true, MaxTokens: 8192, OutputContextWindow: 131072},
+			},
+			channel: upstream.MaasBenefit, wantMax: 131072,
+		},
+		{
+			name: "education",
+			models: []upstream.ModelInfo{
+				{ID: "channel-budget-model", MaasType: upstream.MaasEducation, MaxTokens: 8192, OutputContextWindow: 65536},
+			},
+			channel: upstream.MaasEducation, wantMax: 65536,
+		},
+		{
+			name: "ordinary_unknown_budget",
+			models: []upstream.ModelInfo{
+				{ID: "channel-budget-model", Benefit: true, OutputContextWindow: 8192},
+				{ID: "channel-budget-model"},
+			},
+			wantMax: 214057,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var chats atomic.Int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				chats.Add(1)
+				var body struct {
+					Model     string `json:"model"`
+					MaxTokens int    `json:"max_tokens"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if body.Model != "channel-budget-model" || body.MaxTokens != tc.wantMax || r.Header.Get(upstream.HeaderMaasType) != tc.channel {
+					t.Errorf("request mixed channel/budget: model=%q max=%d channel=%q", body.Model, body.MaxTokens, r.Header.Get(upstream.HeaderMaasType))
+				}
+				if signed := strings.Contains(r.Header.Get("Authorization"), upstream.HeaderMaasType); signed != (tc.channel != "") {
+					t.Errorf("channel signature mismatch: signed=%v channel=%q", signed, tc.channel)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+			}))
+			defer backend.Close()
+			h, p := queueTestHandler(t, backend.URL)
+			upstream.SetAccountModels(p.Accounts()[0].UID, tc.models)
+			payload := `{"model":"channel-budget-model","max_tokens":214057,"messages":[{"role":"user","content":"synthetic test"}]}`
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
+			if rec.Code != http.StatusOK || chats.Load() != 1 {
+				t.Fatalf("chat failed: status=%d chats=%d body=%s", rec.Code, chats.Load(), rec.Body.String())
 			}
 		})
 	}

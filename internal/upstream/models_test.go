@@ -101,7 +101,7 @@ func TestDiscoveredCatalogOverridesSeed(t *testing.T) {
 	}
 }
 
-func TestMergeModelsBenefitAndDeterminism(t *testing.T) {
+func TestMergeModelsKeepsChannelRecordsAndDeterminism(t *testing.T) {
 	agent := []ModelInfo{{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576}}
 	builtin := []ModelInfo{
 		{ID: "GLM-5.2", ContextWindow: 202752},
@@ -110,26 +110,22 @@ func TestMergeModelsBenefitAndDeterminism(t *testing.T) {
 	benefit := []ModelInfo{{ID: "deepseek-v4-pro-0813", Benefit: true, MaxTokens: 8192}}
 
 	got := MergeModels(agent, builtin, benefit)
-	if len(got) != 2 {
-		t.Fatalf("合并后应去重为 2 条，got=%+v", got)
+	if len(got) != 3 {
+		t.Fatalf("同 ID 不同渠道应保留，got=%+v", got)
 	}
-	if got[0].ID != "deepseek-v4-pro-0813" || got[1].ID != "GLM-5.2" {
+	if got[0].ID != "deepseek-v4-pro-0813" || got[1].ID != "deepseek-v4-pro-0813" || got[2].ID != "GLM-5.2" {
 		t.Fatalf("输出顺序应按小写 ID 稳定排序，got=%+v", got)
 	}
-	// 福利标记取或（少标一次就是一次 404），参数取更全的一条。
-	if !got[0].Benefit {
-		t.Error("三路合并后福利标记不得丢失")
+	if got[0].Benefit || got[0].ContextWindow != 1048576 || got[0].MaxTokens != 0 {
+		t.Errorf("普通记录混入了福利路由或预算，got=%+v", got[0])
 	}
-	if got[0].ContextWindow != 1048576 || got[0].MaxTokens != 8192 {
-		t.Errorf("应保留最全的参数，got=%+v", got[0])
-	}
-	if got[1].Benefit {
-		t.Error("内置模型不应带福利标记")
+	if !got[1].Benefit || got[1].MaxTokens != 8192 || got[1].ContextWindow != 0 {
+		t.Errorf("福利记录混入了普通渠道参数，got=%+v", got[1])
 	}
 	// 结果稳定：重复合并顺序一致。
 	again := MergeModels(benefit, builtin, agent)
 	for i := range got {
-		if got[i].ID != again[i].ID {
+		if got[i] != again[i] {
 			t.Fatalf("合并结果不稳定：%v vs %v", got, again)
 		}
 	}

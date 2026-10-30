@@ -23,6 +23,9 @@ func rejectedParamsShape(accountID, model string, messages []upstream.ChatMessag
 		Temperature        *float64       `json:"temperature,omitempty"`
 		TopP               *float64       `json:"top_p,omitempty"`
 		ModelMaxTokens     int64          `json:"model_max_tokens,omitempty"`
+		ModelOutputContext int64          `json:"model_output_context_window,omitempty"`
+		ModelOutputLimit   int64          `json:"model_output_limit,omitempty"`
+		ModelOutputSource  string         `json:"model_output_limit_source,omitempty"`
 		ModelContextWindow int64          `json:"model_context_window,omitempty"`
 		Tools              int            `json:"tools"`
 		ToolChoice         string         `json:"tool_choice,omitempty"`
@@ -57,6 +60,9 @@ func rejectedParamsShape(accountID, model string, messages []upstream.ChatMessag
 	}
 	if info, ok := upstream.AccountModelInfo(accountID, model); ok {
 		shape.ModelMaxTokens = info.MaxTokens
+		shape.ModelOutputContext = info.OutputContextWindow
+		shape.ModelOutputLimit = info.OutputLimit()
+		shape.ModelOutputSource = info.OutputLimitSource()
 		shape.ModelContextWindow = info.ContextWindow
 	}
 	raw, _ := json.Marshal(shape)
